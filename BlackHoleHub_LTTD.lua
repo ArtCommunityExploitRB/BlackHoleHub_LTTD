@@ -97,6 +97,10 @@ end
 ---------------------------------------------------------------------
 local NO_MACRO = "(нет макросов)"
 
+local function pcMode() -- авто-определение устройства
+    return not (UIS.TouchEnabled and not UIS.KeyboardEnabled)
+end
+
 local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
     antiAfk         = true,
     hookRemote      = false,   -- хук Remote (может крашить на некоторых executor)
@@ -110,7 +114,8 @@ local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
     recordMouseMove = true,
     sampleMs        = 1,       -- минимальный интервал между сэмплами (мс). 1 = каждый кадр
     createBak       = true,
-    replayMode      = "Input", -- "Input" | "Remote"
+    replayMode      = "Input",
+    clickMode       = "Roblox", -- "Roblox" (VirtualInputManager) | "Human" (реальный курсор/клавиатура ОС)
     replayMove      = true,
     replayCamera    = true,
     waveGate        = true,
@@ -539,15 +544,8 @@ function Recorder.start()
     end
     if not FS_OK then notify("Запись", "Executor не поддерживает файлы (writefile)", 4) return end
     if cfg.hookRemote then installHook() end
-    Recorder.countingDown = true
-    local cd = math.max(0, math.floor(cfg.countdown or 3))
-    if cd > 0 then
-        notify("Запись", ("Старт через %d сек. Остановка: %s"):format(cd, cfg.stopKey), cd)
-        if cfg.hideOnRecord then pcall(function() Rayfield:SetVisibility(false) end) end
-        task.wait(cd)
-    end
-    Recorder.countingDown = false
     if not State.Alive then return end
+    Recorder.downRec = {}
 
     Recorder.events = {}
     Recorder.t0 = os.clock()
@@ -563,10 +561,7 @@ function Recorder.start()
     local cam = workspace.CurrentCamera
     if cam then Recorder.lastCam = comps12(cam.CFrame); Recorder.add({ type = "cm", c = Recorder.lastCam }) end
 
-    notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "»  (стоп: " .. cfg.stopKey .. ")", 3)
-    if not HOOK_OK then
-        notify("Запись", "Remote не пишутся (включи Hook Remote в Settings) — пишутся ввод и движение", 4)
-    end
+    notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "»  (стоп: F8)", 3)
     recStatus("● Запись: " .. name)
 end
 
@@ -640,12 +635,36 @@ local function mouseButtonIndex(ut)
     return nil
 end
 
+-- клик попал в окно Rayfield? (такие клики не пишем)
+local rfMain
+local function overUI(x, y)
+    if not rfMain or not rfMain.Parent then
+        rfMain = nil
+        pcall(function()
+            local root = (gethui and gethui()) or game:GetService("CoreGui")
+            local g = root:FindFirstChild("Rayfield")
+            rfMain = g and g:FindFirstChild("Main")
+        end)
+    end
+    if not rfMain or not rfMain.Visible then return false end
+    local pos, size = rfMain.AbsolutePosition, rfMain.AbsoluteSize
+    local inset = GuiService:GetGuiInset()
+    for _, off in ipairs({ Vector2.new(0, 0), inset }) do
+        local p = pos + off
+        if x >= p.X - 4 and x <= p.X + size.X + 4 and y >= p.Y - 4 and y <= p.Y + size.Y + 4 then
+            return true
+        end
+    end
+    return false
+end
+
 local function onInput(input, down)
     if not Recorder.active then return end
     local ut = input.UserInputType
     if ut == Enum.UserInputType.Keyboard then
         if input.KeyCode == Enum.KeyCode.Unknown then return end
-        if input.KeyCode.Name == cfg.stopKey then return end
+        local kn = input.KeyCode.Name
+        if pcMode() and (kn == "F8" or kn == "F5") then return end
         if UIS:GetFocusedTextBox() then return end
         Recorder.add({ type = "k", k = input.KeyCode.Name, s = down and 1 or 0 })
         return
@@ -653,16 +672,30 @@ local function onInput(input, down)
     local b = mouseButtonIndex(ut)
     if b then
         local p = inputToPos(input)
+        local dr = Recorder.downRec
+        if down then
+            if overUI(p.x, p.y) then return end
+            dr[b] = true
+        else
+            if not dr[b] then return end -- «отпускание» без нажатия не пишем
+            dr[b] = nil
+        end
         Recorder.add({ type = "mb", b = b, s = down and 1 or 0, x = p.x, y = p.y, rx = p.rx, ry = p.ry })
     end
 end
 
 track(UIS.InputBegan:Connect(function(input)
     -- горячая клавиша остановки записи / воспроизведения
-    if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == cfg.stopKey
+    if pcMode() and input.UserInputType == Enum.UserInputType.Keyboard
         and not UIS:GetFocusedTextBox() then
-        if Recorder.active then Recorder.stop(false) return end
-        if Replay.playing then Replay.stop() return end
+        local kn = input.KeyCode.Name
+        if kn == "F8" then -- запись: старт/стоп мгновенно
+            if Recorder.active then Recorder.stop(false) else task.spawn(Recorder.start) end
+            return
+        elseif kn == "F5" then -- макрос: запуск/стоп
+            if Replay.playing then Replay.stop() else Replay.start(cfg.selectedMacro) end
+            return
+        end
     end
     onInput(input, true)
 end))
@@ -676,6 +709,7 @@ track(UIS.InputChanged:Connect(function(input)
         if t - Recorder.lastMouseMs < (cfg.sampleMs or 1) then return end
         Recorder.lastMouseMs = t
         local p = inputToPos(input)
+        if overUI(p.x, p.y) then return end
         Recorder.add({ type = "mm", x = p.x, y = p.y, rx = p.rx, ry = p.ry })
     elseif ut == Enum.UserInputType.MouseWheel then
         local p = inputToPos(input)
@@ -690,14 +724,72 @@ local heldKeys, heldMouse = {}, {}
 local replayConn
 local prevCamType
 
+-- Способ ввода: "Roblox" = VirtualInputManager (внутри Roblox, не двигает реальный курсор)
+--               "Human"  = реальный курсор и клавиатура ОС (mousemoveabs/mouse1press/keypress), только ПК
+local HUMAN_OK = (mousemoveabs and mouse1press and mouse1release) and true or false
+local function humanMode()
+    return cfg.clickMode == "Human" and HUMAN_OK and pcMode()
+end
+
+local VK = {
+    Space = 0x20, Return = 0x0D, Tab = 0x09, Backspace = 0x08, Escape = 0x1B,
+    LeftShift = 0xA0, RightShift = 0xA1, LeftControl = 0xA2, RightControl = 0xA3,
+    LeftAlt = 0xA4, RightAlt = 0xA5, Left = 0x25, Up = 0x26, Right = 0x27, Down = 0x28,
+    Delete = 0x2E, End = 0x23, Home = 0x24, PageUp = 0x21, PageDown = 0x22, Insert = 0x2D,
+    Backquote = 0xC0, Minus = 0xBD, Equals = 0xBB, Comma = 0xBC, Period = 0xBE, Slash = 0xBF,
+    One = 0x31, Two = 0x32, Three = 0x33, Four = 0x34, Five = 0x35,
+    Six = 0x36, Seven = 0x37, Eight = 0x38, Nine = 0x39, Zero = 0x30,
+}
+local function vkOf(kc)
+    local n = kc.Name
+    if #n == 1 and n:match("%a") then return string.byte(n:upper()) end
+    local f = n:match("^F(%d+)$")
+    if f and tonumber(f) >= 1 and tonumber(f) <= 12 then return 0x6F + tonumber(f) end
+    return VK[n]
+end
+
+local function sendMouseMove(pos)
+    if humanMode() then
+        pcall(mousemoveabs, pos.X, pos.Y)
+    elseif VIM then
+        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
+    end
+end
+
+local function sendMouseButton(b, down, pos)
+    local hp, hr
+    if b == 1 then hp, hr = mouse1press, mouse1release
+    elseif b == 2 then hp, hr = mouse2press, mouse2release end
+    if humanMode() and hp and hr then
+        pcall(mousemoveabs, pos.X, pos.Y)
+        -- небольшая задержка, как у человека: курсор успевает прийти в точку
+        task.delay(0.015, function() pcall(down and hp or hr) end)
+    elseif VIM then
+        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, b - 1, down, game, 0)
+    end
+end
+
+local function sendKey(kc, down)
+    local vk = humanMode() and keypress and keyrelease and vkOf(kc)
+    if vk then
+        pcall(down and keypress or keyrelease, vk)
+    elseif VIM then
+        VIM:SendKeyEvent(down, kc, false, game)
+    end
+end
+
+local function sendWheel(pos, d)
+    if humanMode() and mousescroll then
+        pcall(mousescroll, d > 0 and 120 or -120)
+    elseif VIM then
+        VIM:SendMouseWheelEvent(pos.X, pos.Y, d > 0, game)
+    end
+end
+
 local function releaseAll()
-    if not VIM then return end
-    for kc in pairs(heldKeys) do
-        pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
-    end
-    for b, pos in pairs(heldMouse) do
-        pcall(function() VIM:SendMouseButtonEvent(pos.X, pos.Y, b - 1, false, game, 0) end)
-    end
+    for kc in pairs(heldKeys) do pcall(sendKey, kc, false) end
+    for b, pos in pairs(heldMouse) do pcall(sendMouseButton, b, false, pos) end
     heldKeys, heldMouse = {}, {}
 end
 
@@ -752,31 +844,29 @@ local function execEvent(ev)
         return
     end
 
-    if remoteMode or not VIM then return end
+    if remoteMode or (not VIM and not humanMode()) then return end
 
     if ty == "k" then
         local ok, kc = pcall(function() return Enum.KeyCode[ev.k] end)
         if ok and kc then
             if ev.s == 1 then heldKeys[kc] = true else heldKeys[kc] = nil end
-            VIM:SendKeyEvent(ev.s == 1, kc, false, game)
+            sendKey(kc, ev.s == 1)
         end
     elseif ty == "mb" then
         local pos = toScreen(ev.rx, ev.ry)
-        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, ev.b - 1, ev.s == 1, game, 0)
+        sendMouseButton(ev.b, ev.s == 1, pos)
         if ev.s == 1 then heldMouse[ev.b] = pos else heldMouse[ev.b] = nil end
     elseif ty == "mm" then
-        local pos = toScreen(ev.rx, ev.ry)
-        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
+        sendMouseMove(toScreen(ev.rx, ev.ry))
     elseif ty == "wh" then
-        local pos = toScreen(ev.rx, ev.ry)
-        VIM:SendMouseWheelEvent(pos.X, pos.Y, (ev.d or 0) > 0, game)
+        sendWheel(toScreen(ev.rx, ev.ry), ev.d or 0)
     end
 end
 
 function Replay.start(name)
     if Replay.playing then Replay.stop(true) end
     if Recorder.active or Recorder.countingDown then notify("Макрос", "Идёт запись", 3) return end
+    cfg.replayMode = "Input"
     local macro = loadMacro(name)
     if not macro or type(macro.events) ~= "table" or #macro.events == 0 then
         notify("Макрос", "Макрос пуст или не найден", 3) return
@@ -784,8 +874,8 @@ function Replay.start(name)
     local events = macro.events
     table.sort(events, function(a, b) return (a.t or 0) < (b.t or 0) end)
 
-    if not tostring(cfg.replayMode):find("Remote") and not VIM then
-        notify("Макрос", "VirtualInputManager недоступен — используй режим Remote", 4) return
+    if not VIM and not humanMode() then
+        notify("Макрос", "Нет способа ввода (VirtualInputManager недоступен)", 4) return
     end
 
     Replay.playing = true
@@ -909,92 +999,9 @@ local function queueSelf(showNotify)
 end
 
 track(LocalPlayer.OnTeleport:Connect(function()
+    if Recorder.active then Recorder.stop(false) end -- не теряем запись при телепорте
     if cfg.autoExecute then queueSelf(false) end
 end))
-
----------------------------------------------------------------------
--- Auto Skip / Auto Vote / Auto Replay
----------------------------------------------------------------------
-local function inWaveRange(w)
-    local a, b = pcfg.waveFrom or 1, pcfg.waveTo or 250
-    if a > b then a, b = b, a end
-    return w >= a and w <= b
-end
-
-task.spawn(function()
-    local lastWave, tries, lastClick, voteBefore = -1, 0, 0, 0
-    local voteDone, voteShownAt = false, 0
-    local replayDone, replayShownAt = false, 0
-
-    while State.Alive do
-        task.wait(0.25)
-        pcall(function()
-            ------------------------------------------------ Skip
-            if pcfg.autoSkip then
-                local md = getMatchData()
-                local cw  = md and md:FindFirstChild("CurrentWave")
-                local csk = md and md:FindFirstChild("CanSkip")
-                local vsp = md and md:FindFirstChild("VoteSkipPlayers")
-                if cw and csk then
-                    local wave = cw.Value
-                    if wave ~= lastWave then lastWave, tries, lastClick = wave, 0, 0 end
-                    if inWaveRange(wave) and csk.Value and tries < 3 and os.clock() - lastClick >= 2.5 then
-                        -- повторяем только если голос не засчитался
-                        if tries == 0 or (vsp and vsp.Value <= voteBefore) or not vsp then
-                            local clicked = false
-                            if pcfg.skipPos then
-                                clicked = clickSaved(pcfg.skipPos)
-                            else
-                                local btn = getGui("Match", "TopFrame", "SkipWave")
-                                if btn and isShown(btn) then clicked = clickAt(guiCenter(btn), 0) end
-                            end
-                            if clicked then
-                                tries = tries + 1
-                                lastClick = os.clock()
-                                voteBefore = vsp and vsp.Value or 0
-                            end
-                        end
-                    end
-                end
-            end
-
-            ------------------------------------------------ Vote
-            local vf = getGui("VotingFrame", "VoteFrame")
-            if pcfg.autoVote and vf and isShown(vf) then
-                if voteShownAt == 0 then voteShownAt = os.clock() end
-                if not voteDone and pcfg.votePos then
-                    voteDone = true
-                    task.delay(0.8, function() clickSaved(pcfg.votePos) end)
-                elseif voteDone and os.clock() - voteShownAt > 7 then
-                    voteDone, voteShownAt = false, os.clock() -- повтор, если окно не закрылось
-                end
-            else
-                voteDone, voteShownAt = false, 0
-            end
-
-            ------------------------------------------------ Replay
-            local mf = getGui("Match", "MatchFinish")
-            if pcfg.autoReplay and mf and isShown(mf) then
-                if replayShownAt == 0 then replayShownAt = os.clock() end
-                if not replayDone then
-                    replayDone = true
-                    task.delay(2.5, function()
-                        if pcfg.replayPos then
-                            clickSaved(pcfg.replayPos)
-                        else
-                            local btn = getGui("Match", "MatchFinish", "MatchFinishFrame", "EndOptions", "PlayAgain")
-                            if btn then clickAt(guiCenter(btn), 0) end
-                        end
-                    end)
-                elseif os.clock() - replayShownAt > 9 then
-                    replayDone, replayShownAt = false, os.clock()
-                end
-            else
-                replayDone, replayShownAt = false, 0
-            end
-        end)
-    end
-end)
 
 ---------------------------------------------------------------------
 -- UI (Rayfield)
@@ -1015,64 +1022,17 @@ local function optName(o)
     return o
 end
 
-local PlayerTab   = Window:CreateTab("Player", "user")
 local MacrosTab   = Window:CreateTab("Macros", "video")
 local SettingsTab = Window:CreateTab("Settings", "settings")
 
--------------------------------------------------- Player
-PlayerTab:CreateSection("Auto Skip")
-PlayerTab:CreateToggle({
-    Name = "Auto Skip", CurrentValue = pcfg.autoSkip,
-    Callback = function(v) pcfg.autoSkip = v saveAll() end,
-})
-PlayerTab:CreateButton({
-    Name = "Запомнить кнопку Skip (5 сек)",
-    Callback = function() capturePosition("skipPos", "Skip") end,
-})
-posParas.skipPos = PlayerTab:CreateLabel("Позиция Skip: " .. fmtPos(pcfg.skipPos))
-PlayerTab:CreateSlider({
-    Name = "Скипать с волны", Range = { 1, 250 }, Increment = 1, Suffix = "",
-    CurrentValue = math.clamp(pcfg.waveFrom or 1, 1, 250),
-    Callback = function(v) pcfg.waveFrom = math.floor(v) saveAll() end,
-})
-PlayerTab:CreateSlider({
-    Name = "Скипать до волны", Range = { 1, 250 }, Increment = 1, Suffix = "",
-    CurrentValue = math.clamp(pcfg.waveTo or 250, 1, 250),
-    Callback = function(v) pcfg.waveTo = math.floor(v) saveAll() end,
-})
-
-PlayerTab:CreateSection("Auto Vote")
-PlayerTab:CreateToggle({
-    Name = "Auto Vote", CurrentValue = pcfg.autoVote,
-    Callback = function(v) pcfg.autoVote = v saveAll() end,
-})
-PlayerTab:CreateButton({
-    Name = "Запомнить кнопку Vote (5 сек)",
-    Callback = function() capturePosition("votePos", "Vote") end,
-})
-posParas.votePos = PlayerTab:CreateLabel("Позиция Vote: " .. fmtPos(pcfg.votePos))
-
-PlayerTab:CreateSection("Auto RePlay")
-PlayerTab:CreateToggle({
-    Name = "Auto RePlay", CurrentValue = pcfg.autoReplay,
-    Callback = function(v) pcfg.autoReplay = v saveAll() end,
-})
-PlayerTab:CreateButton({
-    Name = "Запомнить кнопку RePlay (5 сек)",
-    Callback = function() capturePosition("replayPos", "RePlay") end,
-})
-posParas.replayPos = PlayerTab:CreateLabel("Позиция RePlay: " .. fmtPos(pcfg.replayPos))
-
 -------------------------------------------------- Macros
-local statusLabel = MacrosTab:CreateLabel("Статус: " .. (IN_GAME and "готов" or "ты в лобби"))
-setStatus = function(text)
-    pcall(function() statusLabel:Set("Статус: " .. tostring(text)) end)
-end
-
-MacrosTab:CreateSection("Создать / выбрать")
-
 local newMacroName = ""
 local MacroDropdown
+local statusLabel
+
+setStatus = function(text)
+    if statusLabel then pcall(function() statusLabel:Set(tostring(text)) end) end
+end
 
 local function refreshMacros(selectName)
     local list = listMacros()
@@ -1089,12 +1049,12 @@ local function refreshMacros(selectName)
 end
 
 MacrosTab:CreateInput({
-    Name = "Название макроса", PlaceholderText = "Например: Wave1_Setup",
+    Name = "Macros Name", PlaceholderText = "Название макроса",
     RemoveTextAfterFocusLost = false,
     Callback = function(txt) newMacroName = txt end,
 })
 MacrosTab:CreateButton({
-    Name = "Создать макрос",
+    Name = "Create",
     Callback = function()
         local n = createMacro(newMacroName)
         if n then refreshMacros(n) end
@@ -1108,7 +1068,7 @@ do
         cfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
     end
     MacroDropdown = MacrosTab:CreateDropdown({
-        Name = "Выбрать макрос", Options = values,
+        Name = "Select", Options = values,
         CurrentOption = { cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO },
         MultipleOptions = false,
         Callback = function(o)
@@ -1117,98 +1077,50 @@ do
         end,
     })
 end
-MacrosTab:CreateButton({ Name = "Обновить список", Callback = function() refreshMacros() end })
 
-MacrosTab:CreateSection("Запись")
-MacrosTab:CreateButton({
-    Name = "● Записать",
-    Callback = function() task.spawn(Recorder.start) end,
-})
-MacrosTab:CreateButton({
-    Name = "■ Остановить запись и сохранить",
-    Callback = function() Recorder.stop(true) end,
-})
+-- ПК: только F8 (запись) / F5 (запуск) — кнопки меню не работают, чтобы клик не включал запись.
+-- Телефон: работают кнопки.
+local function buttonsAllowed()
+    if pcMode() then
+        notify("Macros", "ПК: F8 — запись, F5 — запуск/стоп", 3)
+        return false
+    end
+    return true
+end
 
-MacrosTab:CreateSection("Запуск")
 MacrosTab:CreateButton({
-    Name = "▶ Запустить макрос",
-    Callback = function() Replay.start(cfg.selectedMacro) end,
-})
-MacrosTab:CreateButton({
-    Name = "■ Остановить макрос",
-    Callback = function() Replay.stop() end,
-})
-MacrosTab:CreateButton({
-    Name = "Удалить выбранный макрос",
+    Name = "Record",
     Callback = function()
-        local n = cfg.selectedMacro
-        if n and n ~= "" and FS_OK and isfile(macroPath(n)) then
-            pcall(delfile, macroPath(n))
-            notify("Макрос", "Удалён: " .. n .. " (.bak сохранён)", 3)
-            cfg.selectedMacro = ""
-            refreshMacros()
-        end
+        if not buttonsAllowed() then return end
+        if Recorder.active then Recorder.stop(true) else task.spawn(Recorder.start) end
+    end,
+})
+MacrosTab:CreateButton({
+    Name = "Play",
+    Callback = function()
+        if not buttonsAllowed() then return end
+        if Recorder.active then notify("Macros", "Идёт запись — сначала останови", 3) return end
+        if Replay.playing then Replay.stop() else Replay.start(cfg.selectedMacro) end
     end,
 })
 
-MacrosTab:CreateSection("Параметры макросов")
 MacrosTab:CreateDropdown({
-    Name = "Режим: Input (клики/клавиши) или Remote",
-    Options = { "Input", "Remote" }, CurrentOption = { cfg.replayMode }, MultipleOptions = false,
-    Callback = function(o) cfg.replayMode = optName(o) saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Повторять движение персонажа", CurrentValue = cfg.replayMove,
-    Callback = function(v) cfg.replayMove = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Повторять камеру", CurrentValue = cfg.replayCamera,
-    Callback = function(v) cfg.replayCamera = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Синхронизация по волнам", CurrentValue = cfg.waveGate,
-    Callback = function(v) cfg.waveGate = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Повторять макрос по кругу", CurrentValue = cfg.loopMacro,
-    Callback = function(v) cfg.loopMacro = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Авто-запуск макроса при входе в матч", CurrentValue = cfg.autoRunMacro,
-    Callback = function(v) cfg.autoRunMacro = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Записывать движение мыши", CurrentValue = cfg.recordMouseMove,
-    Callback = function(v) cfg.recordMouseMove = v saveAll() end,
-})
-MacrosTab:CreateSlider({
-    Name = "Интервал записи, мс (1 = каждый кадр)", Range = { 1, 100 }, Increment = 1, Suffix = " мс",
-    CurrentValue = math.clamp(cfg.sampleMs or 1, 1, 100),
-    Callback = function(v) cfg.sampleMs = math.floor(v) saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Создавать .bak файл", CurrentValue = cfg.createBak,
-    Callback = function(v) cfg.createBak = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Hook Remote (запись вызовов сервера)", CurrentValue = cfg.hookRemote,
-    Callback = function(v)
-        cfg.hookRemote = v saveAll()
-        if v then
-            if installHook() then notify("Hook", "Включён", 2) else notify("Hook", "Executor не поддерживает hookmetamethod", 4) end
+    Name = "Click: Roblox / Human (реальный курсор, ПК)",
+    Options = { "Roblox", "Human" }, CurrentOption = { cfg.clickMode == "Human" and "Human" or "Roblox" },
+    MultipleOptions = false,
+    Callback = function(o)
+        local m = optName(o)
+        if m == "Human" and not (HUMAN_OK and pcMode()) then
+            cfg.clickMode = "Roblox"
+            notify("Click", "Human недоступен (нужен ПК и mousemoveabs/mouse1press) — оставил Roblox", 4)
         else
-            notify("Hook", "Выключится полностью после перезахода", 3)
+            cfg.clickMode = m
+            if m == "Human" then notify("Click", "Human: окно Roblox должно быть в полноэкранном режиме (F11)", 4) end
         end
+        saveAll()
     end,
 })
-
--------------------------------------------------- Settings
-SettingsTab:CreateSection("Основное")
-SettingsTab:CreateToggle({
-    Name = "Anti AFK", CurrentValue = cfg.antiAfk,
-    Callback = function(v) cfg.antiAfk = v saveAll() end,
-})
-SettingsTab:CreateToggle({
+MacrosTab:CreateToggle({
     Name = "Auto Execute", CurrentValue = cfg.autoExecute,
     Callback = function(v)
         cfg.autoExecute = v
@@ -1216,34 +1128,22 @@ SettingsTab:CreateToggle({
         if v then task.delay(0.6, function() queueSelf(true) end) end
     end,
 })
+MacrosTab:CreateToggle({
+    Name = "AutoPlay every match", CurrentValue = cfg.autoRunMacro,
+    Callback = function(v) cfg.autoRunMacro = v saveAll() end,
+})
+statusLabel = MacrosTab:CreateLabel(pcMode() and "ПК: F8 запись | F5 запуск/стоп" or "Телефон: кнопки Record / Play")
 
-SettingsTab:CreateSection("Запись макросов")
-SettingsTab:CreateDropdown({
-    Name = "Горячая клавиша СТОП",
-    Options = { "F6", "F7", "F8", "F9", "F10", "RightControl", "RightShift", "Delete", "End" },
-    CurrentOption = { cfg.stopKey }, MultipleOptions = false,
-    Callback = function(o) cfg.stopKey = optName(o) saveAll() end,
-})
-SettingsTab:CreateSlider({
-    Name = "Отсчёт перед записью (сек)", Range = { 0, 10 }, Increment = 1, Suffix = " с",
-    CurrentValue = math.clamp(cfg.countdown or 3, 0, 10),
-    Callback = function(v) cfg.countdown = math.floor(v) saveAll() end,
-})
+-------------------------------------------------- Settings
 SettingsTab:CreateToggle({
-    Name = "Скрывать окно во время записи", CurrentValue = cfg.hideOnRecord,
-    Callback = function(v) cfg.hideOnRecord = v saveAll() end,
+    Name = "Anti AFK", CurrentValue = cfg.antiAfk,
+    Callback = function(v) cfg.antiAfk = v saveAll() end,
 })
 SettingsTab:CreateSlider({
     Name = "Калибровка Y для кликов (px)", Range = { -60, 60 }, Increment = 1, Suffix = " px",
     CurrentValue = math.clamp(cfg.clickOffsetY or 0, -60, 60),
     Callback = function(v) cfg.clickOffsetY = math.floor(v) saveAll() end,
 })
-
-SettingsTab:CreateSection("Информация")
-SettingsTab:CreateLabel("Папка: " .. ROOT .. "  (Player / Macros)")
-SettingsTab:CreateLabel(("Место: %s | FS: %s | VIM: %s | queue: %s"):format(
-    IN_GAME and "Игра" or (game.PlaceId == LOBBY_PLACE and "Лобби" or tostring(game.PlaceId)),
-    FS_OK and "OK" or "нет", VIM and "OK" or "нет", queueFn and "OK" or "нет"))
 
 refreshMacros()
 
@@ -1252,11 +1152,10 @@ refreshMacros()
 ---------------------------------------------------------------------
 if cfg.autoExecute then queueSelf(false) end
 
+-- AutoPlay every match: скрипт только загрузился в матче -> через 5 сек запускаем выбранный макрос
 if IN_GAME and cfg.autoRunMacro and cfg.selectedMacro ~= "" then
     task.spawn(function()
-        local md = ReplicatedStorage:WaitForChild("MatchData", 30)
-        if not md or not State.Alive then return end
-        task.wait(3)
+        task.wait(5)
         if State.Alive and not Replay.playing and not Recorder.active then
             Replay.start(cfg.selectedMacro)
         end
