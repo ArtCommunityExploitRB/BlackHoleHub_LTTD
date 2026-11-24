@@ -19,7 +19,7 @@
         либо сохрани этот файл как  MacrosBHL_LTTD/BlackHoleHub_LTTD.lua
 ]]
 
-local SELF_URL = "" -- например "https://raw.githubusercontent.com/USER/REPO/main/BlackHoleHub_LTTD.lua"
+local SELF_URL = "https://raw.githubusercontent.com/ArtCommunityExploitRB/BlackHoleHub_LTTD/refs/heads/main/BlackHoleHub_LTTD.lua" -- например "https://raw.githubusercontent.com/USER/REPO/main/BlackHoleHub_LTTD.lua"
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 
