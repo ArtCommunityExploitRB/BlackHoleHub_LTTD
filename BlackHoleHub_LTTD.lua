@@ -427,13 +427,13 @@ end
 local HOOK_OK = false
 genv.BHL_RemoteLogger = function(remote, method, ...)
     if not Recorder.active then return end
+    local packed = table.pack(...)
     pcall(function()
         if typeof(remote) ~= "Instance" then return end
         local cn = remote.ClassName
         if cn ~= "RemoteEvent" and cn ~= "RemoteFunction" and cn ~= "UnreliableRemoteEvent" then return end
         local path = instPath(remote)
         if not path or isExcludedRemotePath(path) then return end
-        local packed = table.pack(...)
         local args = {}
         for i = 1, packed.n do args[i] = ser(packed[i]) end
         Recorder.add({ type = "rm", r = path, m = method, n = packed.n, a = args })
