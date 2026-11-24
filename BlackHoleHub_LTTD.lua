@@ -1,7 +1,7 @@
 --[[
     ╔══════════════════════════════════════════════╗
     ║   BlackHoleHub_LTTD  by  ART1XL1S            ║
-    ║   UI: WindUI                                 ║
+    ║   UI: Rayfield                               ║
     ║   Игра: Legacy (Наследие)                    ║
     ║   Игра PlaceId : 131703399727686             ║
     ║   Лобби PlaceId: 93712201161812              ║
@@ -19,7 +19,7 @@
         либо сохрани этот файл как  MacrosBHL_LTTD/BlackHoleHub_LTTD.lua
 ]]
 
-local SELF_URL = "https://raw.githubusercontent.com/ArtCommunityExploitRB/BlackHoleHub_LTTD/refs/heads/main/BlackHoleHub_LTTD.lua" -- например "https://raw.githubusercontent.com/USER/REPO/main/BlackHoleHub_LTTD.lua"
+local SELF_URL = "https://raw.githubusercontent.com/ArtCommunityExploitRB/BlackHoleHub_LTTD/refs/heads/main/BlackHoleHub_LTTD.lua"
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -99,6 +99,7 @@ local NO_MACRO = "(нет макросов)"
 
 local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
     antiAfk         = true,
+    hookRemote      = false,   -- хук Remote (может крашить на некоторых executor)
     autoExecute     = false,
     stopKey         = "F8",
     countdown       = 3,
@@ -138,27 +139,27 @@ local function saveAll()
 end
 
 ---------------------------------------------------------------------
--- WindUI
+-- Rayfield
 ---------------------------------------------------------------------
-local WindUI
+local Rayfield
 do
     local urls = {
-        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
-        "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+        "https://sirius.menu/rayfield",
+        "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
     }
     for _, url in ipairs(urls) do
         local ok, lib = pcall(function() return loadstring(game:HttpGet(url))() end)
-        if ok and lib then WindUI = lib break end
+        if ok and lib then Rayfield = lib break end
     end
 end
-if not WindUI then
-    warn("[BlackHoleHub_LTTD] Не удалось загрузить WindUI")
+if not Rayfield then
+    warn("[BlackHoleHub_LTTD] Не удалось загрузить Rayfield")
     return
 end
 
 local function notify(title, content, duration)
     pcall(function()
-        WindUI:Notify({ Title = title, Content = content or "", Duration = duration or 3, Icon = "bell" })
+        Rayfield:Notify({ Title = tostring(title), Content = tostring(content or ""), Duration = duration or 3 })
     end)
 end
 
@@ -259,9 +260,10 @@ local function fmtPos(p)
     return ("x=%d  y=%d  (%.1f%% / %.1f%%)"):format(p.x, p.y, p.rx * 100, p.ry * 100)
 end
 
+local posTitles = { skipPos = "Skip", votePos = "Vote", replayPos = "RePlay" }
 local function updatePosPara(key)
-    local para = posParas[key]
-    if para then pcall(function() para:SetDesc(fmtPos(pcfg[key])) end) end
+    local lbl = posParas[key]
+    if lbl then pcall(function() lbl:Set("Позиция " .. posTitles[key] .. ": " .. fmtPos(pcfg[key])) end) end
 end
 
 local function capturePosition(key, label)
@@ -438,26 +440,27 @@ genv.BHL_RemoteLogger = function(remote, method, ...)
     end)
 end
 
-if hookmetamethod and getnamecallmethod and newcclosure and checkcaller then
-    if not genv.BHL_HookInstalled then
-        local ok = pcall(function()
-            local old
-            old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-                local m = getnamecallmethod()
-                if (m == "FireServer" or m == "InvokeServer") and not checkcaller() then
-                    local lg = genv.BHL_RemoteLogger
-                    if lg then
-                        lg(self, m, ...)
-                        if setnamecallmethod then setnamecallmethod(m) end
-                    end
+local function installHook()
+    if genv.BHL_HookInstalled then HOOK_OK = true return true end
+    if not (hookmetamethod and getnamecallmethod and newcclosure and checkcaller) then return false end
+    local ok = pcall(function()
+        local old
+        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local m = getnamecallmethod()
+            if (m == "FireServer" or m == "InvokeServer") and not checkcaller() then
+                local lg = genv.BHL_RemoteLogger
+                if lg then
+                    lg(self, m, ...)
+                    if setnamecallmethod then setnamecallmethod(m) end
                 end
-                return old(self, ...)
-            end))
-        end)
-        if ok then genv.BHL_HookInstalled = true end
-    end
-    HOOK_OK = genv.BHL_HookInstalled and true or false
+            end
+            return old(self, ...)
+        end))
+    end)
+    if ok then genv.BHL_HookInstalled = true HOOK_OK = true end
+    return ok
 end
+if cfg.hookRemote then task.defer(installHook) end
 
 ---------------------------------------------------------------------
 -- Макро-файлы
@@ -524,7 +527,6 @@ end
 ---------------------------------------------------------------------
 -- Запись
 ---------------------------------------------------------------------
-local Window -- объявлен ниже
 
 local function recStatus(t) setStatus(t) end
 
@@ -536,11 +538,12 @@ function Recorder.start()
         notify("Запись", "Сначала создай и выбери макрос", 3) return
     end
     if not FS_OK then notify("Запись", "Executor не поддерживает файлы (writefile)", 4) return end
+    if cfg.hookRemote then installHook() end
     Recorder.countingDown = true
     local cd = math.max(0, math.floor(cfg.countdown or 3))
     if cd > 0 then
         notify("Запись", ("Старт через %d сек. Остановка: %s"):format(cd, cfg.stopKey), cd)
-        if cfg.hideOnRecord then pcall(function() Window:Close() end) end
+        if cfg.hideOnRecord then pcall(function() Rayfield:SetVisibility(false) end) end
         task.wait(cd)
     end
     Recorder.countingDown = false
@@ -562,7 +565,7 @@ function Recorder.start()
 
     notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "»  (стоп: " .. cfg.stopKey .. ")", 3)
     if not HOOK_OK then
-        notify("Запись", "Hook Remote недоступен — пишутся только ввод и движение", 4)
+        notify("Запись", "Remote не пишутся (включи Hook Remote в Settings) — пишутся ввод и движение", 4)
     end
     recStatus("● Запись: " .. name)
 end
@@ -592,7 +595,7 @@ function Recorder.stop(byUi)
         duration = endT, viewport = { x = vp.X, y = vp.Y },
         count = #events, events = events,
     }
-    if byUi then pcall(function() Window:Open() end) end
+    pcall(function() Rayfield:SetVisibility(true) end)
     local ok = saveMacro(Recorder.name, data)
     if ok then
         notify("Запись", ("■ Сохранено «%s»: %d событий, %.1f сек"):format(Recorder.name, #events, endT / 1000), 4)
@@ -994,104 +997,79 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- UI
+-- UI (Rayfield)
 ---------------------------------------------------------------------
-Window = WindUI:CreateWindow({
-    Title = "BlackHoleHub_LTTD",
-    Author = "by ART1XL1S",
-    Icon = "moon",
-    Folder = ROOT .. "/UI",
-    Size = UDim2.fromOffset(580, 440),
-    Theme = "Dark",
-    SideBarWidth = 180,
-    HideSearchBar = true,
+local Window = Rayfield:CreateWindow({
+    Name = "BlackHoleHub_LTTD by ART1XL1S",
+    LoadingTitle = "BlackHoleHub_LTTD",
+    LoadingSubtitle = "by ART1XL1S",
+    ConfigurationSaving = { Enabled = false },
+    Discord = { Enabled = false },
+    KeySystem = false,
+    DisableRayfieldPrompts = true,
+    DisableBuildWarnings = true,
 })
-pcall(function()
-    Window:EditOpenButton({
-        Title = "BlackHoleHub",
-        Icon = "moon",
-        CornerRadius = UDim.new(0, 16),
-        StrokeThickness = 2,
-        Color = ColorSequence.new(Color3.fromRGB(110, 60, 255), Color3.fromRGB(20, 20, 30)),
-        Draggable = true,
-    })
-end)
-
-local function section(tab, title)
-    pcall(function() tab:Section({ Title = title }) end)
-end
 
 local function optName(o)
     if type(o) == "table" then return o.Title or o.Name or o[1] end
     return o
 end
 
-local PlayerTab   = Window:Tab({ Title = "Player",   Icon = "user" })
-local MacrosTab   = Window:Tab({ Title = "Macros",   Icon = "video" })
-local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
+local PlayerTab   = Window:CreateTab("Player", "user")
+local MacrosTab   = Window:CreateTab("Macros", "video")
+local SettingsTab = Window:CreateTab("Settings", "settings")
 
 -------------------------------------------------- Player
-section(PlayerTab, "Auto Skip")
-
-PlayerTab:Toggle({
-    Title = "Auto Skip", Desc = "Автоматически скипает волны в выбранном диапазоне",
-    Default = pcfg.autoSkip,
+PlayerTab:CreateSection("Auto Skip")
+PlayerTab:CreateToggle({
+    Name = "Auto Skip", CurrentValue = pcfg.autoSkip,
     Callback = function(v) pcfg.autoSkip = v saveAll() end,
 })
-PlayerTab:Button({
-    Title = "Запомнить кнопку Skip (5 сек)",
-    Desc = "Нажми кнопку и за 5 секунд кликни на Skip в игре",
+PlayerTab:CreateButton({
+    Name = "Запомнить кнопку Skip (5 сек)",
     Callback = function() capturePosition("skipPos", "Skip") end,
 })
-posParas.skipPos = PlayerTab:Paragraph({ Title = "Позиция Skip", Desc = fmtPos(pcfg.skipPos) })
-
-PlayerTab:Slider({
-    Title = "Скипать с волны", Step = 1,
-    Value = { Min = 1, Max = 250, Default = math.clamp(pcfg.waveFrom or 1, 1, 250) },
+posParas.skipPos = PlayerTab:CreateLabel("Позиция Skip: " .. fmtPos(pcfg.skipPos))
+PlayerTab:CreateSlider({
+    Name = "Скипать с волны", Range = { 1, 250 }, Increment = 1, Suffix = "",
+    CurrentValue = math.clamp(pcfg.waveFrom or 1, 1, 250),
     Callback = function(v) pcfg.waveFrom = math.floor(v) saveAll() end,
 })
-PlayerTab:Slider({
-    Title = "Скипать до волны", Step = 1,
-    Value = { Min = 1, Max = 250, Default = math.clamp(pcfg.waveTo or 250, 1, 250) },
+PlayerTab:CreateSlider({
+    Name = "Скипать до волны", Range = { 1, 250 }, Increment = 1, Suffix = "",
+    CurrentValue = math.clamp(pcfg.waveTo or 250, 1, 250),
     Callback = function(v) pcfg.waveTo = math.floor(v) saveAll() end,
 })
 
-section(PlayerTab, "Auto Vote")
-PlayerTab:Toggle({
-    Title = "Auto Vote", Desc = "Кликает по запомненной позиции, когда появляется голосование",
-    Default = pcfg.autoVote,
+PlayerTab:CreateSection("Auto Vote")
+PlayerTab:CreateToggle({
+    Name = "Auto Vote", CurrentValue = pcfg.autoVote,
     Callback = function(v) pcfg.autoVote = v saveAll() end,
 })
-PlayerTab:Button({
-    Title = "Запомнить кнопку Vote (5 сек)",
-    Desc = "Открой голосование и кликни нужную сложность за 5 секунд",
+PlayerTab:CreateButton({
+    Name = "Запомнить кнопку Vote (5 сек)",
     Callback = function() capturePosition("votePos", "Vote") end,
 })
-posParas.votePos = PlayerTab:Paragraph({ Title = "Позиция Vote", Desc = fmtPos(pcfg.votePos) })
+posParas.votePos = PlayerTab:CreateLabel("Позиция Vote: " .. fmtPos(pcfg.votePos))
 
-section(PlayerTab, "Auto RePlay")
-PlayerTab:Toggle({
-    Title = "Auto RePlay", Desc = "После конца матча кликает по запомненной позиции (Play Again)",
-    Default = pcfg.autoReplay,
+PlayerTab:CreateSection("Auto RePlay")
+PlayerTab:CreateToggle({
+    Name = "Auto RePlay", CurrentValue = pcfg.autoReplay,
     Callback = function(v) pcfg.autoReplay = v saveAll() end,
 })
-PlayerTab:Button({
-    Title = "Запомнить кнопку RePlay (5 сек)",
-    Desc = "На экране конца матча кликни Play Again за 5 секунд",
+PlayerTab:CreateButton({
+    Name = "Запомнить кнопку RePlay (5 сек)",
     Callback = function() capturePosition("replayPos", "RePlay") end,
 })
-posParas.replayPos = PlayerTab:Paragraph({ Title = "Позиция RePlay", Desc = fmtPos(pcfg.replayPos) })
+posParas.replayPos = PlayerTab:CreateLabel("Позиция RePlay: " .. fmtPos(pcfg.replayPos))
 
 -------------------------------------------------- Macros
-local statusPara = MacrosTab:Paragraph({
-    Title = "Статус",
-    Desc = IN_GAME and "Готов" or "Ты в лобби — записывать/запускать макросы лучше в матче",
-})
+local statusLabel = MacrosTab:CreateLabel("Статус: " .. (IN_GAME and "готов" or "ты в лобби"))
 setStatus = function(text)
-    pcall(function() statusPara:SetDesc(text) end)
+    pcall(function() statusLabel:Set("Статус: " .. tostring(text)) end)
 end
 
-section(MacrosTab, "Создать / выбрать")
+MacrosTab:CreateSection("Создать / выбрать")
 
 local newMacroName = ""
 local MacroDropdown
@@ -1103,17 +1081,20 @@ local function refreshMacros(selectName)
     if not table.find(values, cfg.selectedMacro) then
         cfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
     end
-    pcall(function() MacroDropdown:Refresh(values) end)
-    pcall(function() MacroDropdown:Select(cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO) end)
+    if MacroDropdown then
+        pcall(function() MacroDropdown:Refresh(values) end)
+        pcall(function() MacroDropdown:Set({ cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO }) end)
+    end
     saveAll()
 end
 
-MacrosTab:Input({
-    Title = "Название макроса", Placeholder = "Например: Wave1_Setup",
+MacrosTab:CreateInput({
+    Name = "Название макроса", PlaceholderText = "Например: Wave1_Setup",
+    RemoveTextAfterFocusLost = false,
     Callback = function(txt) newMacroName = txt end,
 })
-MacrosTab:Button({
-    Title = "Создать макрос",
+MacrosTab:CreateButton({
+    Name = "Создать макрос",
     Callback = function()
         local n = createMacro(newMacroName)
         if n then refreshMacros(n) end
@@ -1126,39 +1107,39 @@ do
     if not table.find(values, cfg.selectedMacro) then
         cfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
     end
-    MacroDropdown = MacrosTab:Dropdown({
-        Title = "Выбрать макрос", Values = values,
-        Value = cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO,
+    MacroDropdown = MacrosTab:CreateDropdown({
+        Name = "Выбрать макрос", Options = values,
+        CurrentOption = { cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO },
+        MultipleOptions = false,
         Callback = function(o)
             o = optName(o)
             if o and o ~= NO_MACRO then cfg.selectedMacro = o saveAll() end
         end,
     })
 end
-MacrosTab:Button({ Title = "Обновить список", Callback = function() refreshMacros() end })
+MacrosTab:CreateButton({ Name = "Обновить список", Callback = function() refreshMacros() end })
 
-section(MacrosTab, "Запись")
-MacrosTab:Button({
-    Title = "● Записать",
-    Desc = "Пишет всё: движение, камеру, клавиши, клики, мышь, Remote. Стоп — кнопка или горячая клавиша",
+MacrosTab:CreateSection("Запись")
+MacrosTab:CreateButton({
+    Name = "● Записать",
     Callback = function() task.spawn(Recorder.start) end,
 })
-MacrosTab:Button({
-    Title = "■ Остановить запись и сохранить",
+MacrosTab:CreateButton({
+    Name = "■ Остановить запись и сохранить",
     Callback = function() Recorder.stop(true) end,
 })
 
-section(MacrosTab, "Запуск")
-MacrosTab:Button({
-    Title = "▶ Запустить макрос",
+MacrosTab:CreateSection("Запуск")
+MacrosTab:CreateButton({
+    Name = "▶ Запустить макрос",
     Callback = function() Replay.start(cfg.selectedMacro) end,
 })
-MacrosTab:Button({
-    Title = "■ Остановить макрос",
+MacrosTab:CreateButton({
+    Name = "■ Остановить макрос",
     Callback = function() Replay.stop() end,
 })
-MacrosTab:Button({
-    Title = "Удалить выбранный макрос",
+MacrosTab:CreateButton({
+    Name = "Удалить выбранный макрос",
     Callback = function()
         local n = cfg.selectedMacro
         if n and n ~= "" and FS_OK and isfile(macroPath(n)) then
@@ -1170,103 +1151,100 @@ MacrosTab:Button({
     end,
 })
 
-section(MacrosTab, "Параметры макросов")
-MacrosTab:Dropdown({
-    Title = "Режим воспроизведения",
-    Desc = "Input — повтор кликов/клавиш; Remote — прямые вызовы сервера",
-    Values = { "Input", "Remote" }, Value = cfg.replayMode,
+MacrosTab:CreateSection("Параметры макросов")
+MacrosTab:CreateDropdown({
+    Name = "Режим: Input (клики/клавиши) или Remote",
+    Options = { "Input", "Remote" }, CurrentOption = { cfg.replayMode }, MultipleOptions = false,
     Callback = function(o) cfg.replayMode = optName(o) saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Повторять движение персонажа", Default = cfg.replayMove,
+MacrosTab:CreateToggle({
+    Name = "Повторять движение персонажа", CurrentValue = cfg.replayMove,
     Callback = function(v) cfg.replayMove = v saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Повторять камеру", Default = cfg.replayCamera,
+MacrosTab:CreateToggle({
+    Name = "Повторять камеру", CurrentValue = cfg.replayCamera,
     Callback = function(v) cfg.replayCamera = v saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Синхронизация по волнам", Desc = "Событие ждёт свою волну, если игра отстаёт",
-    Default = cfg.waveGate,
+MacrosTab:CreateToggle({
+    Name = "Синхронизация по волнам", CurrentValue = cfg.waveGate,
     Callback = function(v) cfg.waveGate = v saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Повторять макрос по кругу", Default = cfg.loopMacro,
+MacrosTab:CreateToggle({
+    Name = "Повторять макрос по кругу", CurrentValue = cfg.loopMacro,
     Callback = function(v) cfg.loopMacro = v saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Авто-запуск макроса при входе в матч", Default = cfg.autoRunMacro,
+MacrosTab:CreateToggle({
+    Name = "Авто-запуск макроса при входе в матч", CurrentValue = cfg.autoRunMacro,
     Callback = function(v) cfg.autoRunMacro = v saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Записывать движение мыши", Default = cfg.recordMouseMove,
+MacrosTab:CreateToggle({
+    Name = "Записывать движение мыши", CurrentValue = cfg.recordMouseMove,
     Callback = function(v) cfg.recordMouseMove = v saveAll() end,
 })
-MacrosTab:Slider({
-    Title = "Интервал записи (мс)", Desc = "1 = каждый кадр (максимальная точность)", Step = 1,
-    Value = { Min = 1, Max = 100, Default = math.clamp(cfg.sampleMs or 1, 1, 100) },
+MacrosTab:CreateSlider({
+    Name = "Интервал записи, мс (1 = каждый кадр)", Range = { 1, 100 }, Increment = 1, Suffix = " мс",
+    CurrentValue = math.clamp(cfg.sampleMs or 1, 1, 100),
     Callback = function(v) cfg.sampleMs = math.floor(v) saveAll() end,
 })
-MacrosTab:Toggle({
-    Title = "Создавать .bak файл", Default = cfg.createBak,
+MacrosTab:CreateToggle({
+    Name = "Создавать .bak файл", CurrentValue = cfg.createBak,
     Callback = function(v) cfg.createBak = v saveAll() end,
 })
-
--------------------------------------------------- Settings
-section(SettingsTab, "Основное")
-SettingsTab:Toggle({
-    Title = "Anti AFK", Desc = "Не даёт кикнуть за бездействие",
-    Default = cfg.antiAfk,
-    Callback = function(v) cfg.antiAfk = v saveAll() end,
-})
-SettingsTab:Toggle({
-    Title = "Auto Execute", Desc = "Запускает скрипт после телепорта (лобби ⇄ игра)",
-    Default = cfg.autoExecute,
+MacrosTab:CreateToggle({
+    Name = "Hook Remote (запись вызовов сервера)", CurrentValue = cfg.hookRemote,
     Callback = function(v)
-        cfg.autoExecute = v
-        saveAll()
+        cfg.hookRemote = v saveAll()
         if v then
-            task.delay(0.6, function() queueSelf(true) end) -- ждём, пока сохранится Settings.json
+            if installHook() then notify("Hook", "Включён", 2) else notify("Hook", "Executor не поддерживает hookmetamethod", 4) end
+        else
+            notify("Hook", "Выключится полностью после перезахода", 3)
         end
     end,
 })
 
-section(SettingsTab, "Запись макросов")
-SettingsTab:Dropdown({
-    Title = "Горячая клавиша СТОП", Desc = "Остановка записи / воспроизведения",
-    Values = { "F6", "F7", "F8", "F9", "F10", "RightControl", "RightShift", "Delete", "End" },
-    Value = cfg.stopKey,
+-------------------------------------------------- Settings
+SettingsTab:CreateSection("Основное")
+SettingsTab:CreateToggle({
+    Name = "Anti AFK", CurrentValue = cfg.antiAfk,
+    Callback = function(v) cfg.antiAfk = v saveAll() end,
+})
+SettingsTab:CreateToggle({
+    Name = "Auto Execute", CurrentValue = cfg.autoExecute,
+    Callback = function(v)
+        cfg.autoExecute = v
+        saveAll()
+        if v then task.delay(0.6, function() queueSelf(true) end) end
+    end,
+})
+
+SettingsTab:CreateSection("Запись макросов")
+SettingsTab:CreateDropdown({
+    Name = "Горячая клавиша СТОП",
+    Options = { "F6", "F7", "F8", "F9", "F10", "RightControl", "RightShift", "Delete", "End" },
+    CurrentOption = { cfg.stopKey }, MultipleOptions = false,
     Callback = function(o) cfg.stopKey = optName(o) saveAll() end,
 })
-SettingsTab:Slider({
-    Title = "Отсчёт перед записью (сек)", Step = 1,
-    Value = { Min = 0, Max = 10, Default = math.clamp(cfg.countdown or 3, 0, 10) },
+SettingsTab:CreateSlider({
+    Name = "Отсчёт перед записью (сек)", Range = { 0, 10 }, Increment = 1, Suffix = " с",
+    CurrentValue = math.clamp(cfg.countdown or 3, 0, 10),
     Callback = function(v) cfg.countdown = math.floor(v) saveAll() end,
 })
-SettingsTab:Toggle({
-    Title = "Скрывать окно во время записи", Default = cfg.hideOnRecord,
+SettingsTab:CreateToggle({
+    Name = "Скрывать окно во время записи", CurrentValue = cfg.hideOnRecord,
     Callback = function(v) cfg.hideOnRecord = v saveAll() end,
 })
-SettingsTab:Slider({
-    Title = "Калибровка Y для кликов (px)", Desc = "Если клики попадают выше/ниже — подправь", Step = 1,
-    Value = { Min = -60, Max = 60, Default = math.clamp(cfg.clickOffsetY or 0, -60, 60) },
+SettingsTab:CreateSlider({
+    Name = "Калибровка Y для кликов (px)", Range = { -60, 60 }, Increment = 1, Suffix = " px",
+    CurrentValue = math.clamp(cfg.clickOffsetY or 0, -60, 60),
     Callback = function(v) cfg.clickOffsetY = math.floor(v) saveAll() end,
 })
 
-section(SettingsTab, "Информация")
-SettingsTab:Paragraph({
-    Title = "Файлы",
-    Desc = ROOT .. "/Player/Settings.json\n" .. ROOT .. "/Player/Player.json\n" .. ROOT .. "/Macros/<имя>.json (+ .bak)",
-})
-SettingsTab:Paragraph({
-    Title = "Среда",
-    Desc = ("Место: %s\nFS: %s | VIM: %s | Hook Remote: %s | queue_on_teleport: %s"):format(
-        IN_GAME and "Игра" or (game.PlaceId == LOBBY_PLACE and "Лобби" or tostring(game.PlaceId)),
-        FS_OK and "OK" or "нет", VIM and "OK" or "нет",
-        HOOK_OK and "OK" or "нет", queueFn and "OK" or "нет"),
-})
+SettingsTab:CreateSection("Информация")
+SettingsTab:CreateLabel("Папка: " .. ROOT .. "  (Player / Macros)")
+SettingsTab:CreateLabel(("Место: %s | FS: %s | VIM: %s | queue: %s"):format(
+    IN_GAME and "Игра" or (game.PlaceId == LOBBY_PLACE and "Лобби" or tostring(game.PlaceId)),
+    FS_OK and "OK" or "нет", VIM and "OK" or "нет", queueFn and "OK" or "нет"))
 
-Window:SelectTab(1)
 refreshMacros()
 
 ---------------------------------------------------------------------
@@ -1294,7 +1272,7 @@ function State.Cleanup()
     pcall(function() Replay.stop(true) end)
     for _, c in ipairs(State.Conns) do pcall(function() c:Disconnect() end) end
     genv.BHL_RemoteLogger = nil
-    pcall(function() Window:Destroy() end)
+    pcall(function() Rayfield:Destroy() end)
 end
 
 notify("BlackHoleHub_LTTD", "by ART1XL1S — загружено", 3)
