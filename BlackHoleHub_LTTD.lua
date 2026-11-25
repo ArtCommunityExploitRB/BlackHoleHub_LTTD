@@ -118,7 +118,7 @@ local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
     clickMode       = "Roblox", -- "Roblox" (VirtualInputManager) | "Human" (реальный курсор/клавиатура ОС)
     replayMove      = true,
     replayCamera    = true,
-    waveGate        = true,
+    waveGate        = false,
     loopMacro       = false,
     autoRunMacro    = false,
 })
@@ -781,6 +781,9 @@ track(UIS.InputChanged:Connect(function(input)
         Recorder.lastMouseMs = t
         local p = inputToPos(input)
         if overUI(p.x, p.y) then return end
+        local lp = Recorder.lastMousePos
+        if lp and math.abs(p.x - lp.x) + math.abs(p.y - lp.y) < 4 then return end
+        Recorder.lastMousePos = p
         Recorder.add({ type = "mm", x = p.x, y = p.y, rx = p.rx, ry = p.ry })
     elseif ut == Enum.UserInputType.MouseWheel then
         local p = inputToPos(input)
@@ -1001,11 +1004,8 @@ function Replay.start(name)
             return
         end
 
-        local function waiting(e)
-            if not cfg.waveGate then return false end
-            local cw = curWave()
-            return cw ~= nil and e.w and e.w > 0 and cw < e.w
-        end
+        -- Ожидание волн отключено: макрос идёт строго по записанному времени
+        local function waiting(e) return false end
 
         if waiting(ev) then
             if os.clock() - lastStatus > 0.5 then
@@ -1026,7 +1026,7 @@ function Replay.start(name)
 
         if os.clock() - lastStatus > 0.5 then
             lastStatus = os.clock()
-            setStatus(("▶ %s  [%d/%d]  %.1f сек"):format(name, i - 1, #events, clock / 1000))
+            setStatus(("▶ %d/%d"):format(i - 1, #events))
         end
     end)
 end
@@ -1206,7 +1206,7 @@ MacrosTab:CreateButton({
 })
 
 MacrosTab:CreateDropdown({
-    Name = "Click: Roblox / Human (реальный курсор, ПК)",
+    Name = "Click Mode",
     Options = { "Roblox", "Human" }, CurrentOption = { cfg.clickMode == "Human" and "Human" or "Roblox" },
     MultipleOptions = false,
     Callback = function(o)
