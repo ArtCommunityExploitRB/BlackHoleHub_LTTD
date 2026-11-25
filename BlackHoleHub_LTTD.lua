@@ -411,6 +411,8 @@ local setStatus = function() end
 local function nowMs() return math.floor((os.clock() - Recorder.t0) * 1000) end
 
 function Recorder.add(ev)
+    Recorder.seq = (Recorder.seq or 0) + 1
+    ev.q = Recorder.seq
     ev.t = nowMs()
     ev.w = curWave() or 0
     Recorder.events[#Recorder.events + 1] = ev
@@ -546,6 +548,7 @@ function Recorder.start()
     if cfg.hookRemote then installHook() end
     if not State.Alive then return end
     Recorder.downRec = {}
+    Recorder.seq = 0
 
     Recorder.events = {}
     Recorder.t0 = os.clock()
@@ -587,6 +590,7 @@ function Recorder.stop(byUi)
     local data = {
         name = Recorder.name, version = 1, created = os.time(),
         placeId = game.PlaceId, map = mapId and mapId.Value or nil,
+        device = pcMode() and "PC" or "Mobile",
         duration = endT, viewport = { x = vp.X, y = vp.Y },
         count = #events, events = events,
     }
@@ -635,6 +639,69 @@ local function mouseButtonIndex(ut)
     return nil
 end
 
+-- Кросс-девайс: вместо пикселей экрана запоминаем ЧТО нажато:
+--   g  = GUI-кнопка под курсором (путь внутри PlayerGui)
+--   wp = точка в мире под курсором (по ней клик пересчитывается под любой экран)
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function worldAt(x, y)
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local ok, res = pcall(function()
+        local char = LocalPlayer.Character
+        rayParams.FilterDescendantsInstances = char and { char } or {}
+        local ray = cam:ViewportPointToRay(x, y)
+        local hit = workspace:Raycast(ray.Origin, ray.Direction * 2000, rayParams)
+        local pt = hit and hit.Position or (ray.Origin + ray.Direction * 500)
+        return { r3(pt.X), r3(pt.Y), r3(pt.Z) }
+    end)
+    return ok and res or nil
+end
+
+local function guiPathOf(obj)
+    local p, cur = {}, obj
+    while cur and cur ~= PlayerGui do
+        table.insert(p, 1, cur.Name)
+        cur = cur.Parent
+    end
+    if cur ~= PlayerGui then return nil end
+    return p
+end
+
+local function guiTargetAt(x, y)
+    local vp = viewport()
+    local inset = GuiService:GetGuiInset()
+    local cands = {}
+    for _, mode in ipairs({ false, true }) do -- IgnoreGuiInset = false / true
+        local ok, list = pcall(function()
+            return PlayerGui:GetGuiObjectsAtPosition(x, mode and y or (y - inset.Y))
+        end)
+        if ok and list then
+            for _, o in ipairs(list) do
+                local sg = o:FindFirstAncestorOfClass("ScreenGui")
+                if sg and sg.IgnoreGuiInset == mode then cands[#cands + 1] = o end
+            end
+        end
+    end
+    for _, o in ipairs(cands) do
+        if o:IsA("GuiButton") then return guiPathOf(o) end
+    end
+    for _, o in ipairs(cands) do
+        if o.AbsoluteSize.X < vp.X * 0.6 and o.AbsoluteSize.Y < vp.Y * 0.6 then return guiPathOf(o) end
+    end
+    return nil
+end
+
+local function resolveFrom(root, path)
+    local cur = root
+    for _, n in ipairs(path) do
+        cur = cur and cur:FindFirstChild(n)
+        if not cur then return nil end
+    end
+    return cur
+end
+
 -- клик попал в окно Rayfield? (такие клики не пишем)
 local rfMain
 local function overUI(x, y)
@@ -673,14 +740,18 @@ local function onInput(input, down)
     if b then
         local p = inputToPos(input)
         local dr = Recorder.downRec
+        local tgt
         if down then
             if overUI(p.x, p.y) then return end
-            dr[b] = true
+            tgt = { g = guiTargetAt(p.x, p.y), wp = worldAt(p.x, p.y) }
+            dr[b] = tgt
         else
-            if not dr[b] then return end -- «отпускание» без нажатия не пишем
+            tgt = dr[b]
+            if not tgt then return end -- «отпускание» без нажатия не пишем
             dr[b] = nil
         end
-        Recorder.add({ type = "mb", b = b, s = down and 1 or 0, x = p.x, y = p.y, rx = p.rx, ry = p.ry })
+        Recorder.add({ type = "mb", b = b, s = down and 1 or 0, x = p.x, y = p.y, rx = p.rx, ry = p.ry,
+            g = tgt.g, wp = tgt.wp })
     end
 end
 
@@ -746,6 +817,26 @@ local function vkOf(kc)
     local f = n:match("^F(%d+)$")
     if f and tonumber(f) >= 1 and tonumber(f) <= 12 then return 0x6F + tonumber(f) end
     return VK[n]
+end
+
+-- Позиция клика для ЭТОГО экрана: GUI-кнопка -> точка в мире -> запасной вариант (проценты)
+local function resolveClickPos(ev)
+    local off = Vector2.new(0, cfg.clickOffsetY or 0)
+    if ev.g then
+        local obj = resolveFrom(PlayerGui, ev.g)
+        if obj and obj:IsA("GuiObject") and isShown(obj) then
+            local c = guiCenter(obj)
+            if c then return c + off end
+        end
+    end
+    if ev.wp then
+        local cam = workspace.CurrentCamera
+        if cam then
+            local v, on = cam:WorldToViewportPoint(Vector3.new(ev.wp[1], ev.wp[2], ev.wp[3]))
+            if on and v.Z > 0 then return Vector2.new(v.X, v.Y) + off end
+        end
+    end
+    return toScreen(ev.rx, ev.ry)
 end
 
 local function sendMouseMove(pos)
@@ -853,12 +944,14 @@ local function execEvent(ev)
             sendKey(kc, ev.s == 1)
         end
     elseif ty == "mb" then
-        local pos = toScreen(ev.rx, ev.ry)
+        local pos = resolveClickPos(ev)
         sendMouseButton(ev.b, ev.s == 1, pos)
         if ev.s == 1 then heldMouse[ev.b] = pos else heldMouse[ev.b] = nil end
     elseif ty == "mm" then
+        if Replay.cross then return end -- другое устройство: путь курсора не повторяем
         sendMouseMove(toScreen(ev.rx, ev.ry))
     elseif ty == "wh" then
+        if Replay.cross then return end
         sendWheel(toScreen(ev.rx, ev.ry), ev.d or 0)
     end
 end
@@ -872,7 +965,15 @@ function Replay.start(name)
         notify("Макрос", "Макрос пуст или не найден", 3) return
     end
     local events = macro.events
-    table.sort(events, function(a, b) return (a.t or 0) < (b.t or 0) end)
+    table.sort(events, function(a, b)
+        if (a.t or 0) ~= (b.t or 0) then return (a.t or 0) < (b.t or 0) end
+        return (a.q or 0) < (b.q or 0)
+    end)
+    local dev = pcMode() and "PC" or "Mobile"
+    Replay.cross = (macro.device ~= nil and macro.device ~= dev)
+    if Replay.cross then
+        notify("Макрос", ("Записан на %s, запуск на %s — клики пересчитаны под этот экран"):format(macro.device, dev), 4)
+    end
 
     if not VIM and not humanMode() then
         notify("Макрос", "Нет способа ввода (VirtualInputManager недоступен)", 4) return
