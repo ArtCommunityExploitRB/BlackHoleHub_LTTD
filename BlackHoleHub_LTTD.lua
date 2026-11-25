@@ -121,6 +121,7 @@ local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
     waveGate        = false,
     loopMacro       = false,
     autoRunMacro    = false,
+    maxPauseMs      = 1000,    -- макс. пауза между событиями (мс). Более длинные сжимаются
 })
 
 local pcfg = mergeDefaults(readJson(PLAYER_FILE, {}), {
@@ -781,9 +782,6 @@ track(UIS.InputChanged:Connect(function(input)
         Recorder.lastMouseMs = t
         local p = inputToPos(input)
         if overUI(p.x, p.y) then return end
-        local lp = Recorder.lastMousePos
-        if lp and math.abs(p.x - lp.x) + math.abs(p.y - lp.y) < 4 then return end
-        Recorder.lastMousePos = p
         Recorder.add({ type = "mm", x = p.x, y = p.y, rx = p.rx, ry = p.ry })
     elseif ut == Enum.UserInputType.MouseWheel then
         local p = inputToPos(input)
@@ -972,6 +970,31 @@ function Replay.start(name)
         if (a.t or 0) ~= (b.t or 0) then return (a.t or 0) < (b.t or 0) end
         return (a.q or 0) < (b.q or 0)
     end)
+
+    -- ── Сжатие длинных пауз ─────────────────────────────────────────
+    -- Если между событиями записан большой разрыв (например, ожидание
+    -- следующей волны), он урезается до cfg.maxPauseMs, чтобы воспроизведение
+    -- не «висело» на пустом месте.
+    local maxPause = tonumber(cfg.maxPauseMs) or 0
+    if maxPause > 0 and #events > 0 then
+        local out = {}
+        local lastOrig, lastNew = 0, 0
+        for idx, ev in ipairs(events) do
+            local origT = ev.t or 0
+            local gap = origT - lastOrig
+            if gap < 0 then gap = 0 end
+            if gap > maxPause then gap = maxPause end
+            lastNew = lastNew + gap
+            lastOrig = origT
+            local ne = {}
+            for k, v in pairs(ev) do ne[k] = v end
+            ne.t = lastNew
+            out[idx] = ne
+        end
+        events = out
+    end
+    -- ────────────────────────────────────────────────────────────────
+
     local dev = pcMode() and "PC" or "Mobile"
     Replay.cross = (macro.device ~= nil and macro.device ~= dev)
     if Replay.cross then
@@ -1004,20 +1027,10 @@ function Replay.start(name)
             return
         end
 
-        -- Ожидание волн отключено: макрос идёт строго по записанному времени
-        local function waiting(e) return false end
-
-        if waiting(ev) then
-            if os.clock() - lastStatus > 0.5 then
-                lastStatus = os.clock()
-                setStatus(("⏳ Жду волну %d (сейчас %s)  [%d/%d]"):format(ev.w, tostring(curWave()), i, #events))
-            end
-            return -- таймлиния на паузе
-        end
-
+        -- защита от лаговых скачков dt (после подвисания игра не «выстреливает» пачкой)
+        if dt > 0.5 then dt = 0.5 end
         clock = clock + dt * 1000
         while ev and ev.t <= clock do
-            if waiting(ev) then break end
             local ok, err = pcall(execEvent, ev)
             if not ok then warn("[BHL] event error:", err) end
             i = i + 1
@@ -1026,7 +1039,7 @@ function Replay.start(name)
 
         if os.clock() - lastStatus > 0.5 then
             lastStatus = os.clock()
-            setStatus(("▶ %d/%d"):format(i - 1, #events))
+            setStatus(("▶ %s  [%d/%d]  %.1f сек"):format(name, i - 1, #events, clock / 1000))
         end
     end)
 end
@@ -1063,10 +1076,11 @@ local queued = false
 
 local function buildQueueSource()
     local loader
-    if SELF_URL ~= "" then
-        loader = ("loadstring(game:HttpGet(%q))()"):format(SELF_URL)
-    elseif FS_OK and isfile(MAIN_FILE) then
+    -- Сначала локальный файл (актуальная версия), и только если его нет — URL
+    if FS_OK and isfile(MAIN_FILE) then
         loader = ("loadstring(readfile(%q))()"):format(MAIN_FILE)
+    elseif SELF_URL ~= "" then
+        loader = ("loadstring(game:HttpGet(%q))()"):format(SELF_URL)
     else
         return nil
     end
@@ -1074,7 +1088,7 @@ local function buildQueueSource()
 if not game:IsLoaded() then game.Loaded:Wait() end
 local okc, c = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(%q)) end)
 if okc and type(c) == "table" and c.autoExecute then
-    task.wait(2)
+    task.wait(1)
     %s
 end
 ]]):format(SETTINGS_FILE, loader)
@@ -1206,7 +1220,7 @@ MacrosTab:CreateButton({
 })
 
 MacrosTab:CreateDropdown({
-    Name = "Click Mode",
+    Name = "Click: Roblox / Human (реальный курсор, ПК)",
     Options = { "Roblox", "Human" }, CurrentOption = { cfg.clickMode == "Human" and "Human" or "Roblox" },
     MultipleOptions = false,
     Callback = function(o)
@@ -1245,6 +1259,15 @@ SettingsTab:CreateSlider({
     CurrentValue = math.clamp(cfg.clickOffsetY or 0, -60, 60),
     Callback = function(v) cfg.clickOffsetY = math.floor(v) saveAll() end,
 })
+SettingsTab:CreateSlider({
+    Name = "Сжатие пауз в макросе (мс)",
+    Range = { 0, 5000 }, Increment = 50, Suffix = " ms",
+    CurrentValue = math.clamp(cfg.maxPauseMs or 1000, 0, 5000),
+    Callback = function(v)
+        cfg.maxPauseMs = math.floor(v)
+        saveAll()
+    end,
+})
 
 refreshMacros()
 
@@ -1253,10 +1276,10 @@ refreshMacros()
 ---------------------------------------------------------------------
 if cfg.autoExecute then queueSelf(false) end
 
--- AutoPlay every match: скрипт только загрузился в матче -> через 5 сек запускаем выбранный макрос
+-- AutoPlay every match: скрипт только загрузился в матче -> через 2 сек запускаем выбранный макрос
 if IN_GAME and cfg.autoRunMacro and cfg.selectedMacro ~= "" then
     task.spawn(function()
-        task.wait(5)
+        task.wait(2)
         if State.Alive and not Replay.playing and not Recorder.active then
             Replay.start(cfg.selectedMacro)
         end
