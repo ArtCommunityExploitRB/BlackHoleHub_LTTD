@@ -1,34 +1,30 @@
 --[[
-    ╔══════════════════════════════════════════════╗
-    ║   BlackHoleHub_LTTD  by  ART1XL1S            ║
-    ║   UI: Rayfield                               ║
-    ║   Игра: Legacy (Наследие)                    ║
-    ║   Игра PlaceId : 131703399727686             ║
-    ║   Лобби PlaceId: 93712201161812              ║
-    ╚══════════════════════════════════════════════╝
+    BlackHoleHub_LTTD  by  ART1XL1S      (UI: Rayfield)
+    Игра: Legacy   PlaceId игры 131703399727686 | лобби 93712201161812
 
-    Принцип работы:
-      ● Запись — фиксируется КАЖДОЕ событие с точным временем в миллисекундах
-        (движение мыши, клики с точными пикселями, клавиши, колесо).
-      ● Воспроизведение — идёт строго по таймлайну из макроса,
-        клики ставятся РОВНО туда, куда ты кликал при записи (по ratio rx/ry).
-      ● Никакого «ожидания волн» больше нет.
+    Папка MacrosBHL_LTTD/
+        Player/Settings.json   настройки скрипта
+        Player/Player.json     выбранный макрос, AutoPlay
+        Macros/<имя>.json      макрос (Actions: Place / Upgrade / Target / Sell / Skip / Vote ...)
+        Macros/<имя>.bak       резервная копия
+
+    ПК:      F8 = запись старт/стоп, F5 = запуск/стоп макроса
+    Телефон: кнопки Record / Play
+
+    Для Auto Execute: SELF_URL (raw-ссылка на этот файл) ИЛИ файл MacrosBHL_LTTD/BlackHoleHub_LTTD.lua
 ]]
 
 local SELF_URL = "https://raw.githubusercontent.com/ArtCommunityExploitRB/BlackHoleHub_LTTD/refs/heads/main/BlackHoleHub_LTTD.lua"
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 
----------------------------------------------------------------------
--- Повторный запуск
----------------------------------------------------------------------
 local genv = (getgenv and getgenv()) or _G
 if genv.BHL_LTTD and type(genv.BHL_LTTD.Cleanup) == "function" then
     pcall(genv.BHL_LTTD.Cleanup)
 end
 local State = { Alive = true, Conns = {} }
 genv.BHL_LTTD = State
-local function track(c) table.insert(State.Conns, c) return c end
+local function track(c) State.Conns[#State.Conns + 1] = c return c end
 
 ---------------------------------------------------------------------
 -- Сервисы
@@ -50,6 +46,11 @@ local GAME_PLACE  = 131703399727686
 local LOBBY_PLACE = 93712201161812
 local IN_GAME     = (game.PlaceId == GAME_PLACE)
 
+-- Устройство определяется автоматически
+local function pcMode()
+    return not (UIS.TouchEnabled and not UIS.KeyboardEnabled)
+end
+
 ---------------------------------------------------------------------
 -- Файлы
 ---------------------------------------------------------------------
@@ -62,7 +63,7 @@ local MAIN_FILE     = ROOT .. "/BlackHoleHub_LTTD.lua"
 
 local FS_OK = (writefile and readfile and isfile and isfolder and makefolder) and true or false
 if FS_OK then
-    for _, d in ipairs({ ROOT, PLAYER_DIR, MACROS_DIR, ROOT .. "/UI" }) do
+    for _, d in ipairs({ ROOT, PLAYER_DIR, MACROS_DIR }) do
         if not isfolder(d) then pcall(makefolder, d) end
     end
 end
@@ -77,7 +78,7 @@ end
 
 local function writeJson(path, data)
     if not FS_OK then return false end
-    return pcall(function() writefile(path, HttpService:JSONEncode(data)) end)
+    return (pcall(function() writefile(path, HttpService:JSONEncode(data)) end))
 end
 
 local function mergeDefaults(t, defaults)
@@ -87,37 +88,17 @@ local function mergeDefaults(t, defaults)
     return t
 end
 
----------------------------------------------------------------------
--- Конфиги
----------------------------------------------------------------------
 local NO_MACRO = "(нет макросов)"
-local function pcMode() return not (UIS.TouchEnabled and not UIS.KeyboardEnabled) end
 
 local cfg = mergeDefaults(readJson(SETTINGS_FILE, {}), {
-    antiAfk         = true,
-    hookRemote      = false,
-    autoExecute     = false,
-    clickOffsetY    = 0,
-    -- макросы
-    selectedMacro   = "",
-    recordMouseMove = true,
-    sampleMs        = 1,        -- минимальный интервал между сэмплами движения (мс)
-    createBak       = true,
-    replayMode      = "Input",
-    clickMode       = "Roblox", -- "Roblox" | "Human"
-    replayMove      = true,
-    replayCamera    = true,
-    loopMacro       = false,
-    autoRunMacro    = false,
-    maxPauseMs      = 0,        -- 0 = НЕ сжимать паузы (точь-в-точь). >0 = сжать всё что дольше N мс
+    antiAfk      = true,
+    autoExecute  = false,
+    clickMode    = "Roblox", -- "Roblox" (внутри игры) | "Human" (реальный курсор ПК)
+    clickOffsetY = 0,
 })
-
 local pcfg = mergeDefaults(readJson(PLAYER_FILE, {}), {
-    autoSkip   = false,
-    autoVote   = false,
-    autoReplay = false,
-    waveFrom   = 1,
-    waveTo     = 250,
+    selectedMacro = "",
+    autoPlay      = false,
 })
 
 local saveQueued = false
@@ -132,38 +113,24 @@ local function saveAll()
 end
 
 ---------------------------------------------------------------------
--- Rayfield
+-- Утилиты
 ---------------------------------------------------------------------
-local Rayfield
-do
-    local urls = {
-        "https://sirius.menu/rayfield",
-        "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
-    }
-    for _, url in ipairs(urls) do
-        local ok, lib = pcall(function() return loadstring(game:HttpGet(url))() end)
-        if ok and lib then Rayfield = lib break end
-    end
-end
-if not Rayfield then
-    warn("[BlackHoleHub_LTTD] Не удалось загрузить Rayfield")
-    return
-end
-
+local Rayfield -- загружается позже, в потоке интерфейса
 local function notify(title, content, duration)
+    if not Rayfield then return end
     pcall(function()
         Rayfield:Notify({ Title = tostring(title), Content = tostring(content or ""), Duration = duration or 3 })
     end)
 end
 
----------------------------------------------------------------------
--- Утилиты
----------------------------------------------------------------------
-local function getMatchData() return ReplicatedStorage:FindFirstChild("MatchData") end
+local setStatus = function() end
+
+local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
+
 local function curWave()
-    local md = getMatchData()
+    local md = ReplicatedStorage:FindFirstChild("MatchData")
     local v = md and md:FindFirstChild("CurrentWave")
-    return v and v.Value or nil
+    return v and v.Value or 0
 end
 
 local function viewport()
@@ -176,141 +143,40 @@ local function toScreen(rx, ry)
     return Vector2.new(rx * vp.X, ry * vp.Y + (cfg.clickOffsetY or 0))
 end
 
--- позиция курсора → {x, y, rx, ry} с точностью 4 знака (0.01% экрана)
-local function cursorPos()
-    local vp = viewport()
-    local pos = UIS:GetMouseLocation()
-    return {
-        x  = math.floor(pos.X),
-        y  = math.floor(pos.Y),
-        rx = math.floor(pos.X / vp.X * 10000 + 0.5) / 10000,
-        ry = math.floor(pos.Y / vp.Y * 10000 + 0.5) / 10000,
-    }
+local function isShown(obj)
+    if not obj then return false end
+    local cur = obj
+    while cur and cur ~= PlayerGui do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
 end
 
-local function touchPos(input)
-    local vp = viewport()
-    local pos = Vector2.new(input.Position.X, input.Position.Y) + GuiService:GetGuiInset()
-    return {
-        x  = math.floor(pos.X),
-        y  = math.floor(pos.Y),
-        rx = math.floor(pos.X / vp.X * 10000 + 0.5) / 10000,
-        ry = math.floor(pos.Y / vp.Y * 10000 + 0.5) / 10000,
-    }
+-- точка внутри GUI-объекта (ox, oy от 0 до 1) в координатах экрана
+local function guiPoint(obj, ox, oy)
+    local ap, sz = obj.AbsolutePosition, obj.AbsoluteSize
+    local pos = Vector2.new(ap.X + sz.X * ox, ap.Y + sz.Y * oy)
+    local sg = obj:FindFirstAncestorOfClass("ScreenGui")
+    if sg and not sg.IgnoreGuiInset then pos = pos + GuiService:GetGuiInset() end
+    return pos
 end
 
 local function inputToPos(input)
-    if input.UserInputType == Enum.UserInputType.Touch then return touchPos(input) end
-    return cursorPos()
-end
-
----------------------------------------------------------------------
--- Сериализация Remote (для hookRemote)
----------------------------------------------------------------------
-local function r3(x) return math.floor(x * 1000 + 0.5) / 1000 end
-
-local function instPath(inst)
-    local p, cur = {}, inst
-    while cur and cur ~= game do
-        local n = cur.Name
-        if n == LocalPlayer.Name then n = "%LP%" end
-        table.insert(p, 1, n)
-        cur = cur.Parent
+    local vp = viewport()
+    local pos
+    if input.UserInputType == Enum.UserInputType.Touch then
+        pos = Vector2.new(input.Position.X, input.Position.Y) + GuiService:GetGuiInset()
+    else
+        pos = UIS:GetMouseLocation()
     end
-    if cur ~= game then return nil end
-    return p
+    return {
+        x = math.floor(pos.X), y = math.floor(pos.Y),
+        rx = math.floor(pos.X / vp.X * 10000 + 0.5) / 10000,
+        ry = math.floor(pos.Y / vp.Y * 10000 + 0.5) / 10000,
+    }
 end
-
-local function resolvePath(p)
-    local cur = game
-    for _, n in ipairs(p) do
-        if n == "%LP%" then n = LocalPlayer.Name end
-        cur = cur and cur:FindFirstChild(n)
-        if not cur then return nil end
-    end
-    return cur
-end
-
-local function ser(v, depth)
-    depth = depth or 0
-    if depth > 6 then return { t = "nil" } end
-    local ty = typeof(v)
-    if ty == "nil" then return { t = "nil" }
-    elseif ty == "boolean" or ty == "string" then return v
-    elseif ty == "number" then
-        if v ~= v or v == math.huge or v == -math.huge then return { t = "num", v = tostring(v) } end
-        return v
-    elseif ty == "Vector3" then return { t = "v3", v = { v.X, v.Y, v.Z } }
-    elseif ty == "Vector2" then return { t = "v2", v = { v.X, v.Y } }
-    elseif ty == "CFrame" then return { t = "cf", v = { v:GetComponents() } }
-    elseif ty == "Color3" then return { t = "c3", v = { v.R, v.G, v.B } }
-    elseif ty == "EnumItem" then return { t = "en", v = tostring(v) }
-    elseif ty == "Instance" then
-        if v == LocalPlayer then return { t = "lp" } end
-        return { t = "inst", p = instPath(v), n = v.Name }
-    elseif ty == "table" then
-        local n = #v
-        local arr, hash = {}, nil
-        for i = 1, n do arr[i] = ser(v[i], depth + 1) end
-        for k, val in pairs(v) do
-            if not (type(k) == "number" and k >= 1 and k <= n and math.floor(k) == k) then
-                hash = hash or {}
-                hash[#hash + 1] = { ser(k, depth + 1), ser(val, depth + 1) }
-            end
-        end
-        return { t = "tbl", n = n, a = arr, h = hash }
-    end
-    return { t = "unsup", ty = ty }
-end
-
-local function deser(v)
-    if type(v) ~= "table" then return v end
-    local t = v.t
-    if t == "nil" or t == "unsup" then return nil
-    elseif t == "num" then return tonumber(v.v)
-    elseif t == "v3" then return Vector3.new(v.v[1], v.v[2], v.v[3])
-    elseif t == "v2" then return Vector2.new(v.v[1], v.v[2])
-    elseif t == "cf" then return CFrame.new(unpack(v.v))
-    elseif t == "c3" then return Color3.new(v.v[1], v.v[2], v.v[3])
-    elseif t == "en" then
-        local _, _, en, item = tostring(v.v):find("^Enum%.([^%.]+)%.(.+)$")
-        local ok, res = pcall(function() return Enum[en][item] end)
-        return ok and res or nil
-    elseif t == "lp" then return LocalPlayer
-    elseif t == "inst" then return v.p and resolvePath(v.p) or nil
-    elseif t == "tbl" then
-        local out = {}
-        for i = 1, (v.n or #v.a) do out[i] = deser(v.a[i]) end
-        if v.h then
-            for _, kv in ipairs(v.h) do
-                local k = deser(kv[1])
-                if k ~= nil then out[k] = deser(kv[2]) end
-            end
-        end
-        return out
-    end
-    return nil
-end
-
-local function isExcludedRemotePath(path)
-    for _, seg in ipairs(path) do
-        local s = tostring(seg)
-        if s:find("Test Remotes", 1, true) or s == "CmdrClient" or s == "AdminTools" then return true end
-    end
-    return false
-end
-
----------------------------------------------------------------------
--- Recorder
----------------------------------------------------------------------
-local Recorder = {
-    active = false, events = {}, t0 = 0,
-    lastMove, lastCam, lastSample = -1000, lastMouseMs = -1000,
-}
-local Replay = { playing = false }
-local setStatus = function() end
-
-local function nowMs() return math.floor((os.clock() - Recorder.t0) * 1000) end
 
 local function comps12(cf)
     local c = { cf:GetComponents() }
@@ -324,51 +190,14 @@ local function sameComps(a, b)
     return true
 end
 
-function Recorder.add(ev)
-    Recorder.seq = (Recorder.seq or 0) + 1
-    ev.q = Recorder.seq
-    ev.t = nowMs()
-    ev.w = curWave() or 0
-    Recorder.events[#Recorder.events + 1] = ev
+local function resolveFrom(root, path)
+    local cur = root
+    for _, n in ipairs(path) do
+        cur = cur and cur:FindFirstChild(n)
+        if not cur then return nil end
+    end
+    return cur
 end
-
--- Remote hook
-genv.BHL_RemoteLogger = function(remote, method, ...)
-    if not Recorder.active then return end
-    local packed = table.pack(...)
-    pcall(function()
-        if typeof(remote) ~= "Instance" then return end
-        local cn = remote.ClassName
-        if cn ~= "RemoteEvent" and cn ~= "RemoteFunction" and cn ~= "UnreliableRemoteEvent" then return end
-        local path = instPath(remote)
-        if not path or isExcludedRemotePath(path) then return end
-        local args = {}
-        for i = 1, packed.n do args[i] = ser(packed[i]) end
-        Recorder.add({ type = "rm", r = path, m = method, n = packed.n, a = args })
-    end)
-end
-
-local function installHook()
-    if genv.BHL_HookInstalled then return true end
-    if not (hookmetamethod and getnamecallmethod and newcclosure and checkcaller) then return false end
-    local ok = pcall(function()
-        local old
-        old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            local m = getnamecallmethod()
-            if (m == "FireServer" or m == "InvokeServer") and not checkcaller() then
-                local lg = genv.BHL_RemoteLogger
-                if lg then
-                    lg(self, m, ...)
-                    if setnamecallmethod then setnamecallmethod(m) end
-                end
-            end
-            return old(self, ...)
-        end))
-    end)
-    if ok then genv.BHL_HookInstalled = true end
-    return ok
-end
-if cfg.hookRemote then task.defer(installHook) end
 
 ---------------------------------------------------------------------
 -- Макро-файлы
@@ -400,234 +229,151 @@ end
 
 local function saveMacro(name, data)
     if not FS_OK then return false end
-    local path = macroPath(name)
     local ok, json = pcall(function() return HttpService:JSONEncode(data) end)
     if not ok then return false end
-    if cfg.createBak then
-        local content = json
-        if isfile(path) then
-            local okr, old = pcall(readfile, path)
-            if okr and old and #old > 2 then content = old end
-        end
-        pcall(writefile, macroBak(name), content)
+    local path = macroPath(name)
+    -- .bak = предыдущая версия файла (если была), иначе копия текущей
+    local bak = json
+    if isfile(path) then
+        local okr, old = pcall(readfile, path)
+        if okr and old and #old > 50 then bak = old end
     end
-    return pcall(writefile, path, json)
+    pcall(writefile, macroBak(name), bak)
+    return (pcall(writefile, path, json))
 end
 
 local function loadMacro(name)
-    if name == "" or name == NO_MACRO then return nil end
+    if not name or name == "" or name == NO_MACRO then return nil end
     return readJson(macroPath(name), nil)
+end
+
+local function newMacroData(name)
+    local vp = viewport()
+    return {
+        Name = name, Game = "LegacyTD", Version = 2, Created = os.time(),
+        Device = pcMode() and "PC" or "Mobile",
+        Viewport = { X = vp.X, Y = vp.Y },
+        TimeOrigin = "Start", TimeBasis = "Seconds",
+        Duration = 0, ActionCount = 0, Actions = {},
+    }
 end
 
 local function createMacro(name)
     name = sanitize(name)
-    if name == "" then notify("Макрос", "Введи название", 3) return nil end
-    if FS_OK and isfile(macroPath(name)) then notify("Макрос", "Уже существует", 3) return nil end
-    local data = { name = name, version = 2, created = os.time(), placeId = game.PlaceId, duration = 0, events = {} }
-    if not saveMacro(name, data) then notify("Макрос", "Не удалось создать файл", 3) return nil end
-    notify("Макрос", "Создан: " .. name, 3)
+    if name == "" then notify("Macros", "Введи название макроса", 3) return nil end
+    if FS_OK and isfile(macroPath(name)) then notify("Macros", "«" .. name .. "» уже существует", 3) return nil end
+    if not saveMacro(name, newMacroData(name)) then notify("Macros", "Не удалось создать файл", 3) return nil end
+    notify("Macros", "Создан: " .. name, 3)
     return name
 end
 
 ---------------------------------------------------------------------
--- ЗАПИСЬ
+-- Поиск целей клика: GUI-кнопка / точка в мире / юнит
 ---------------------------------------------------------------------
-function Recorder.start()
-    if Recorder.active then return end
-    if Replay.playing then notify("Запись", "Сначала останови воспроизведение", 3) return end
-    local name = cfg.selectedMacro
-    if not name or name == "" or name == NO_MACRO then
-        notify("Запись", "Сначала создай и выбери макрос", 3) return
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function guiPathOf(obj)
+    local p, cur = {}, obj
+    while cur and cur ~= PlayerGui do
+        table.insert(p, 1, cur.Name)
+        cur = cur.Parent
     end
-    if not FS_OK then notify("Запись", "Executor не поддерживает файлы", 4) return end
-    if cfg.hookRemote then installHook() end
-
-    Recorder.downRec = {}
-    Recorder.seq = 0
-    Recorder.events = {}
-    Recorder.t0 = os.clock()
-    Recorder.lastMove, Recorder.lastCam = nil, nil
-    Recorder.lastSample, Recorder.lastMouseMs = -1000, -1000
-    Recorder.name = name
-    Recorder.active = true
-
-    -- стартовый снимок позиции и камеры
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp then Recorder.lastMove = comps12(hrp.CFrame); Recorder.add({ type = "mv", c = Recorder.lastMove }) end
-    local cam = workspace.CurrentCamera
-    if cam then Recorder.lastCam = comps12(cam.CFrame); Recorder.add({ type = "cm", c = Recorder.lastCam }) end
-
-    notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "» (стоп: F8)", 3)
-    setStatus("● Запись: " .. name)
+    if cur ~= PlayerGui then return nil end
+    return p
 end
 
-function Recorder.stop(byUi)
-    if not Recorder.active then return end
-    Recorder.active = false
-    local endT = nowMs()
-    local events = Recorder.events
+-- реальные элементы интерфейса, а не прозрачные контейнеры
+local function meaningful(o)
+    if o:IsA("GuiButton") then return true end
+    if o:IsA("TextLabel") then return o.Text ~= "" end
+    if o:IsA("ImageLabel") then return o.ImageTransparency < 1 end
+    return o.BackgroundTransparency < 1
+end
 
-    if byUi then
-        -- вырезаем клик по кнопке Стоп в UI Rayfield (последние 600мс кликов мыши)
-        local cut, clean = endT - 600, {}
-        for _, ev in ipairs(events) do
-            local mouse = (ev.type == "mb" or ev.type == "mm" or ev.type == "wh")
-            if not (mouse and ev.t >= cut) then clean[#clean + 1] = ev end
-        end
-        events = clean
-    end
-
+-- возвращает путь к самому «точному» элементу под курсором и смещение внутри него
+local function guiTargetAt(x, y)
     local vp = viewport()
-    local md = getMatchData()
-    local mapId = md and md:FindFirstChild("MapId")
-    local data = {
-        name = Recorder.name, version = 2, created = os.time(),
-        placeId = game.PlaceId, map = mapId and mapId.Value or nil,
-        device = pcMode() and "PC" or "Mobile",
-        duration = endT, viewport = { x = vp.X, y = vp.Y },
-        count = #events, events = events,
-    }
-    pcall(function() Rayfield:SetVisibility(true) end)
-    local ok = saveMacro(Recorder.name, data)
-    if ok then
-        notify("Запись", ("■ Сохранено «%s»: %d событий, %.2f сек"):format(Recorder.name, #events, endT / 1000), 4)
-    else
-        notify("Запись", "Ошибка сохранения!", 4)
-    end
-    setStatus(("Сохранено: %s (%d событий, %.2f сек)"):format(Recorder.name, #events, endT / 1000))
-    Recorder.events = {}
-end
-
--- Heartbeat — движение персонажа и камеры
-track(RunService.Heartbeat:Connect(function()
-    if not Recorder.active then return end
-    local t = nowMs()
-    if t - Recorder.lastSample < (cfg.sampleMs or 1) then return end
-    Recorder.lastSample = t
-
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        local c = comps12(hrp.CFrame)
-        if not sameComps(c, Recorder.lastMove) then
-            Recorder.lastMove = c
-            Recorder.add({ type = "mv", c = c })
-        end
-    end
-    local cam = workspace.CurrentCamera
-    if cam then
-        local c = comps12(cam.CFrame)
-        if not sameComps(c, Recorder.lastCam) then
-            Recorder.lastCam = c
-            Recorder.add({ type = "cm", c = c })
-        end
-    end
-end))
-
--- Скрываем клики по своему UI из записи
-local rfMain
-local function overUI(x, y)
-    if not rfMain or not rfMain.Parent then
-        rfMain = nil
-        pcall(function()
-            local root = (gethui and gethui()) or game:GetService("CoreGui")
-            local g = root:FindFirstChild("Rayfield")
-            rfMain = g and g:FindFirstChild("Main")
-        end)
-    end
-    if not rfMain or not rfMain.Visible then return false end
-    local pos, size = rfMain.AbsolutePosition, rfMain.AbsoluteSize
     local inset = GuiService:GetGuiInset()
-    for _, off in ipairs({ Vector2.new(0, 0), inset }) do
-        local p = pos + off
-        if x >= p.X - 4 and x <= p.X + size.X + 4 and y >= p.Y - 4 and y <= p.Y + size.Y + 4 then
-            return true
+    local best, bestBtn
+    for _, ignore in ipairs({ false, true }) do
+        local ok, list = pcall(function()
+            return PlayerGui:GetGuiObjectsAtPosition(x, ignore and y or (y - inset.Y))
+        end)
+        if ok and list then
+            for _, o in ipairs(list) do
+                local sg = o:FindFirstAncestorOfClass("ScreenGui")
+                local sz = o.AbsoluteSize
+                if sg and sg.IgnoreGuiInset == ignore and sz.X > 0 and sz.Y > 0
+                    and sz.X < vp.X * 0.6 and sz.Y < vp.Y * 0.6 and meaningful(o) then
+                    local area = sz.X * sz.Y
+                    local item = { o = o, a = area, gy = ignore and y or (y - inset.Y) }
+                    if o:IsA("GuiButton") and (not bestBtn or area < bestBtn.a) then bestBtn = item end
+                    if not best or area < best.a then best = item end
+                end
+            end
         end
     end
-    return false
+    local pick = bestBtn or best
+    if not pick then return nil end
+    local o = pick.o
+    local ap, sz = o.AbsolutePosition, o.AbsoluteSize
+    local ox = math.clamp((x - ap.X) / sz.X, 0, 1)
+    local oy = math.clamp((pick.gy - ap.Y) / sz.Y, 0, 1)
+    return guiPathOf(o), { r3(ox), r3(oy) }
 end
 
-local function mouseButtonIndex(ut)
-    if ut == Enum.UserInputType.MouseButton1 or ut == Enum.UserInputType.Touch then return 1 end
-    if ut == Enum.UserInputType.MouseButton2 then return 2 end
-    if ut == Enum.UserInputType.MouseButton3 then return 3 end
-    return nil
-end
-
-local function onInput(input, down)
-    if not Recorder.active then return end
-    local ut = input.UserInputType
-
-    -- клавиатура
-    if ut == Enum.UserInputType.Keyboard then
-        if input.KeyCode == Enum.KeyCode.Unknown then return end
-        local kn = input.KeyCode.Name
-        if pcMode() and (kn == "F8" or kn == "F5") then return end
-        if UIS:GetFocusedTextBox() then return end
-        Recorder.add({ type = "k", k = kn, s = down and 1 or 0 })
-        return
-    end
-
-    -- мышь / тач
-    local b = mouseButtonIndex(ut)
-    if b then
-        local p = inputToPos(input)
-        if down then
-            if overUI(p.x, p.y) then return end
-            Recorder.downRec[b] = p
-        else
-            if not Recorder.downRec[b] then return end -- отпускание без нажатия не пишем
-            Recorder.downRec[b] = nil
+local function worldInfo(x, y)
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local ok, res = pcall(function()
+        local filter = {}
+        local char = LocalPlayer.Character
+        if char then filter[#filter + 1] = char end
+        local pm = workspace:FindFirstChild("PlacingModels")
+        if pm then filter[#filter + 1] = pm end
+        rayParams.FilterDescendantsInstances = filter
+        local ray = cam:ViewportPointToRay(x, y)
+        local hit = workspace:Raycast(ray.Origin, ray.Direction * 2000, rayParams)
+        local pt = hit and hit.Position or (ray.Origin + ray.Direction * 500)
+        local info = { Pos = { r3(pt.X), r3(pt.Y), r3(pt.Z) } }
+        local troops = workspace:FindFirstChild("Troops")
+        if hit and troops then
+            local cur = hit.Instance
+            while cur and cur ~= workspace do
+                if cur.Parent == troops then
+                    local pv = cur:GetPivot().Position
+                    info.Model = cur
+                    info.UnitPos = { r3(pv.X), r3(pv.Y), r3(pv.Z) }
+                    info.Off = { r3(pt.X - pv.X), r3(pt.Y - pv.Y), r3(pt.Z - pv.Z) }
+                    break
+                end
+                cur = cur.Parent
+            end
         end
-        -- Записываем ТОЧНЫЕ пиксели и ratio в момент клика
-        Recorder.add({
-            type = "mb", b = b, s = down and 1 or 0,
-            x = p.x, y = p.y, rx = p.rx, ry = p.ry,
-        })
-    end
+        return info
+    end)
+    return ok and res or nil
 end
 
-track(UIS.InputBegan:Connect(function(input)
-    -- F8 = запись, F5 = воспроизведение
-    if pcMode() and input.UserInputType == Enum.UserInputType.Keyboard
-        and not UIS:GetFocusedTextBox() then
-        local kn = input.KeyCode.Name
-        if kn == "F8" then
-            if Recorder.active then Recorder.stop(false) else task.spawn(Recorder.start) end
-            return
-        elseif kn == "F5" then
-            if Replay.playing then Replay.stop() else Replay.start(cfg.selectedMacro) end
-            return
-        end
-    end
-    onInput(input, true)
-end))
-track(UIS.InputEnded:Connect(function(input) onInput(input, false) end))
-track(UIS.InputChanged:Connect(function(input)
-    if not Recorder.active then return end
-    local ut = input.UserInputType
-    if ut == Enum.UserInputType.MouseMovement then
-        if not cfg.recordMouseMove then return end
-        local t = nowMs()
-        if t - Recorder.lastMouseMs < (cfg.sampleMs or 1) then return end
-        Recorder.lastMouseMs = t
-        local p = inputToPos(input)
-        if overUI(p.x, p.y) then return end
-        Recorder.add({ type = "mm", x = p.x, y = p.y, rx = p.rx, ry = p.ry })
-    elseif ut == Enum.UserInputType.MouseWheel then
-        local p = inputToPos(input)
-        Recorder.add({ type = "wh", d = input.Position.Z, rx = p.rx, ry = p.ry })
-    end
-end))
+-- Вид действия по GUI-элементу
+local function classifyGui(path)
+    local s = table.concat(path, "/")
+    if s:find("SkipWave") then return "Skip" end
+    if s:find("AutoSkip") then return "AutoSkip" end
+    if path[1] == "VotingFrame" or s:find("VoteFrame") then return "Vote" end
+    if s:find("PlayAgain") then return "PlayAgain" end
+    if s:find("ReturnToLobby") then return "Lobby" end
+    if s:find("Upgrade") then return "Upgrade" end
+    if s:find("Target") then return "Target" end
+    if s:find("Sell") then return "Sell" end
+    if s:find("Troop%d") then return "Slot" end
+    return "Click"
+end
 
 ---------------------------------------------------------------------
--- ВОСПРОИЗВЕДЕНИЕ
+-- Ввод (воспроизведение): Roblox / Human / Touch
 ---------------------------------------------------------------------
-local heldKeys, heldMouse = {}, {}
-local replayConn
-local prevCamType
-
 local HUMAN_OK = (mousemoveabs and mouse1press and mouse1release) and true or false
 local function humanMode()
     return cfg.clickMode == "Human" and HUMAN_OK and pcMode()
@@ -650,33 +396,37 @@ local function vkOf(kc)
     return VK[n]
 end
 
-local function sendMouseMove(pos)
-    if humanMode() then
-        pcall(mousemoveabs, pos.X, pos.Y)
-    elseif VIM then
-        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
-    end
-end
-
-local function sendMouseButton(b, down, pos)
-    local hp, hr
-    if b == 1 then hp, hr = mouse1press, mouse1release
-    elseif b == 2 then hp, hr = mouse2press, mouse2release end
-    if humanMode() and hp and hr then
-        pcall(mousemoveabs, pos.X, pos.Y)
-        task.delay(0.015, function() pcall(down and hp or hr) end)
-    elseif VIM then
-        VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, b - 1, down, game, 0)
-    end
-end
+local heldKeys = {}
 
 local function sendKey(kc, down)
     local vk = humanMode() and keypress and keyrelease and vkOf(kc)
     if vk then
         pcall(down and keypress or keyrelease, vk)
     elseif VIM then
-        VIM:SendKeyEvent(down, kc, false, game)
+        pcall(function() VIM:SendKeyEvent(down, kc, false, game) end)
+    end
+end
+
+local function sendMouse(button, down, pos)
+    local hp, hr
+    if button == 1 then hp, hr = mouse1press, mouse1release
+    elseif button == 2 then hp, hr = mouse2press, mouse2release end
+    if humanMode() and hp and hr then
+        pcall(mousemoveabs, pos.X, pos.Y)
+        pcall(down and hp or hr)
+    elseif VIM then
+        pcall(function()
+            VIM:SendMouseMoveEvent(pos.X, pos.Y, game)
+            VIM:SendMouseButtonEvent(pos.X, pos.Y, button - 1, down, game, 0)
+        end)
+    end
+end
+
+local function sendMove(pos)
+    if humanMode() then
+        pcall(mousemoveabs, pos.X, pos.Y)
+    elseif VIM then
+        pcall(function() VIM:SendMouseMoveEvent(pos.X, pos.Y, game) end)
     end
 end
 
@@ -684,168 +434,447 @@ local function sendWheel(pos, d)
     if humanMode() and mousescroll then
         pcall(mousescroll, d > 0 and 120 or -120)
     elseif VIM then
-        VIM:SendMouseWheelEvent(pos.X, pos.Y, d > 0, game)
+        pcall(function() VIM:SendMouseWheelEvent(pos.X, pos.Y, d > 0, game) end)
     end
 end
 
-local function releaseAll()
-    for kc in pairs(heldKeys) do pcall(sendKey, kc, false) end
-    for b, pos in pairs(heldMouse) do pcall(sendMouseButton, b, false, pos) end
-    heldKeys, heldMouse = {}, {}
+-- клик с задержкой (курсор успевает прийти в точку) — в отдельном потоке
+local function doClick(pos, button, hold)
+    task.spawn(function()
+        local touched = false
+        if (not pcMode()) and VIM and button == 1 and not humanMode() then
+            touched = pcall(function() VIM:SendTouchEvent(1, 0, pos.X, pos.Y) end)
+        end
+        if not touched then
+            sendMove(pos)
+            task.wait(0.04)
+            sendMouse(button, true, pos)
+        end
+        task.wait(math.max(hold or 0, 0.04))
+        if touched then
+            pcall(function() VIM:SendTouchEvent(1, 2, pos.X, pos.Y) end)
+        else
+            sendMouse(button, false, pos)
+        end
+    end)
 end
+
+local function doKey(kc, hold)
+    task.spawn(function()
+        heldKeys[kc] = true
+        sendKey(kc, true)
+        task.wait(math.max(hold or 0, 0.03))
+        sendKey(kc, false)
+        heldKeys[kc] = nil
+    end)
+end
+
+---------------------------------------------------------------------
+-- Запись
+---------------------------------------------------------------------
+local Recorder = {
+    active = false, starting = false, t0 = 0, actions = {},
+    pendClick = {}, pendKey = {}, unitKey = {}, nextKey = 0,
+    selectedKey = nil, lastWorld = nil, lastWorldClock = 0,
+    lastMove = nil, lastCam = nil,
+}
+local Replay = { playing = false, token = 0, sameView = false, cross = false }
+
+local function nowSec() return math.floor((os.clock() - Recorder.t0) * 1000 + 0.5) / 1000 end
+
+local function addAction(a)
+    a.Time = nowSec()
+    a.Wave = curWave()
+    Recorder.actions[#Recorder.actions + 1] = a
+    return a
+end
+
+local function unitKeyFor(model)
+    local k = Recorder.unitKey[model]
+    if not k then
+        Recorder.nextKey = Recorder.nextKey + 1
+        k = "T" .. Recorder.nextKey
+        Recorder.unitKey[model] = k
+    end
+    return k
+end
+
+-- Rayfield-окно: клики по нему не пишем
+local rfMain
+local function overUI(x, y)
+    if not rfMain or not rfMain.Parent then
+        rfMain = nil
+        pcall(function()
+            local root = (gethui and gethui()) or game:GetService("CoreGui")
+            local g = root:FindFirstChild("Rayfield")
+            rfMain = g and g:FindFirstChild("Main")
+        end)
+    end
+    if not rfMain or not rfMain.Visible then return false end
+    local pos, size = rfMain.AbsolutePosition, rfMain.AbsoluteSize
+    local inset = GuiService:GetGuiInset()
+    for _, off in ipairs({ Vector2.new(0, 0), inset }) do
+        local p = pos + off
+        if x >= p.X - 6 and x <= p.X + size.X + 6 and y >= p.Y - 6 and y <= p.Y + size.Y + 6 then
+            return true
+        end
+    end
+    return false
+end
+
+function Recorder.start()
+    if Recorder.active or Recorder.starting then return end
+    if Replay.playing then notify("Запись", "Сначала останови макрос", 3) return end
+    local name = pcfg.selectedMacro
+    if not name or name == "" or name == NO_MACRO then
+        notify("Запись", "Сначала создай и выбери макрос", 3) return
+    end
+    if not FS_OK then notify("Запись", "Executor без writefile", 4) return end
+
+    Recorder.actions, Recorder.pendClick, Recorder.pendKey = {}, {}, {}
+    Recorder.unitKey, Recorder.nextKey, Recorder.selectedKey = {}, 0, nil
+    Recorder.lastWorld, Recorder.lastMove, Recorder.lastCam = nil, nil, nil
+    Recorder.t0 = os.clock()
+    Recorder.name = name
+    Recorder.active = true
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        Recorder.lastMove = comps12(hrp.CFrame)
+        addAction({ Kind = "Move", CFrame = Recorder.lastMove })
+    end
+    local cam = workspace.CurrentCamera
+    if cam then
+        Recorder.lastCam = comps12(cam.CFrame)
+        addAction({ Kind = "Camera", CFrame = Recorder.lastCam })
+    end
+    notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "»", 3)
+    setStatus("● Запись: " .. name)
+end
+
+function Recorder.stop(byUi)
+    if not Recorder.active then return end
+    Recorder.active = false
+    local endT = nowSec()
+
+    -- закрываем незавершённые нажатия
+    for _, a in pairs(Recorder.pendClick) do a.Hold = r3(math.max(endT - a.Time, 0.05)) end
+    for _, a in pairs(Recorder.pendKey) do a.Hold = r3(math.max(endT - a.Time, 0.05)) end
+    Recorder.pendClick, Recorder.pendKey = {}, {}
+
+    local actions = Recorder.actions
+    if byUi then
+        -- вырезаем клик по кнопке «Record» (последние 0.6 сек)
+        local clean = {}
+        for _, a in ipairs(actions) do
+            if not (a.Button and a.Time >= endT - 0.6) then clean[#clean + 1] = a end
+        end
+        actions = clean
+    end
+
+    local data = newMacroData(Recorder.name)
+    local md = ReplicatedStorage:FindFirstChild("MatchData")
+    local mapId = md and md:FindFirstChild("MapId")
+    data.Map = mapId and mapId.Value or nil
+    data.Duration = endT
+    data.ActionCount = #actions
+    data.Actions = actions
+
+    local ok = saveMacro(Recorder.name, data)
+    if ok then
+        notify("Запись", ("■ Сохранено «%s»: %d действий, %.0f сек"):format(Recorder.name, #actions, endT), 4)
+    else
+        notify("Запись", "Ошибка сохранения!", 4)
+    end
+    setStatus(("Сохранено: %s (%d действий)"):format(Recorder.name, #actions))
+    Recorder.actions = {}
+end
+
+-- каждый кадр: движение и камера
+track(RunService.Heartbeat:Connect(function()
+    if not Recorder.active then return end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local c = comps12(hrp.CFrame)
+        if not sameComps(c, Recorder.lastMove) then
+            Recorder.lastMove = c
+            addAction({ Kind = "Move", CFrame = c })
+        end
+    end
+    local cam = workspace.CurrentCamera
+    if cam then
+        local c = comps12(cam.CFrame)
+        if not sameComps(c, Recorder.lastCam) then
+            Recorder.lastCam = c
+            addAction({ Kind = "Camera", CFrame = c })
+        end
+    end
+end))
+
+local function buttonIndex(ut)
+    if ut == Enum.UserInputType.MouseButton1 or ut == Enum.UserInputType.Touch then return 1 end
+    if ut == Enum.UserInputType.MouseButton2 then return 2 end
+    if ut == Enum.UserInputType.MouseButton3 then return 3 end
+    return nil
+end
+
+local function onInput(input, down, gp)
+    if not Recorder.active then return end
+    local ut = input.UserInputType
+
+    if ut == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode.Unknown then return end
+        local kn = input.KeyCode.Name
+        if pcMode() and (kn == "F8" or kn == "F5") then return end
+        if UIS:GetFocusedTextBox() then return end
+        if down then
+            local a = addAction({ Kind = "Key", Key = kn, Hold = 0 })
+            Recorder.pendKey[kn] = a
+        else
+            local a = Recorder.pendKey[kn]
+            if a then a.Hold = r3(math.max(nowSec() - a.Time, 0.03)) Recorder.pendKey[kn] = nil end
+        end
+        return
+    end
+
+    local b = buttonIndex(ut)
+    if not b then return end
+    local p = inputToPos(input)
+
+    if down then
+        if overUI(p.x, p.y) then return end
+        local gui, go = guiTargetAt(p.x, p.y)
+        -- тач, который съела игра и не привязан к кнопке (джойстик, прыжок) — пропускаем
+        if ut == Enum.UserInputType.Touch and gp and not gui then return end
+
+        local a = { Kind = "Click", Button = b, Hold = 0, Rx = p.rx, Ry = p.ry, X = p.x, Y = p.y }
+        if gui then
+            a.Gui, a.Go = gui, go
+            a.Kind = classifyGui(gui)
+            if a.Kind == "Vote" then a.Name = gui[#gui] end
+            if a.Kind == "Upgrade" or a.Kind == "Target" or a.Kind == "Sell" then a.Key = Recorder.selectedKey end
+        else
+            local w = worldInfo(p.x, p.y)
+            if w then
+                a.Pos = w.Pos
+                if w.Model then
+                    a.Kind = "Select"
+                    a.Key = unitKeyFor(w.Model)
+                    a.Name = w.Model.Name
+                    a.UnitPos, a.Off = w.UnitPos, w.Off
+                    Recorder.selectedKey = a.Key
+                else
+                    Recorder.lastWorld, Recorder.lastWorldClock = a, os.clock()
+                end
+            end
+        end
+        addAction(a)
+        Recorder.pendClick[b] = a
+    else
+        local a = Recorder.pendClick[b]
+        if a then
+            a.Hold = r3(math.max(nowSec() - a.Time, 0.04))
+            Recorder.pendClick[b] = nil
+        end
+    end
+end
+
+-- Новый юнит в Workspace.Troops сразу после клика по земле = Place
+if IN_GAME then
+    task.spawn(function()
+        local troops = workspace:WaitForChild("Troops", 15)
+        if not troops or not State.Alive then return end
+        track(troops.ChildAdded:Connect(function(child)
+            if not Recorder.active then return end
+            local a = Recorder.lastWorld
+            if not a or os.clock() - Recorder.lastWorldClock > 2.5 then return end
+            Recorder.lastWorld = nil
+            task.wait(0.1)
+            pcall(function()
+                local pv = child:GetPivot().Position
+                a.Kind = "Place"
+                a.Name = child.Name
+                a.Key = unitKeyFor(child)
+                a.UnitPos = { r3(pv.X), r3(pv.Y), r3(pv.Z) }
+                Recorder.selectedKey = a.Key
+            end)
+        end))
+    end)
+end
+
+---------------------------------------------------------------------
+-- Воспроизведение
+---------------------------------------------------------------------
+local prevCamType
 
 function Replay.stop(silent)
     if not Replay.playing then return end
     Replay.playing = false
-    if replayConn then replayConn:Disconnect() replayConn = nil end
-    releaseAll()
+    Replay.token = Replay.token + 1
+    if Replay.conn then Replay.conn:Disconnect() Replay.conn = nil end
+    for kc in pairs(heldKeys) do sendKey(kc, false) end
+    heldKeys = {}
     local cam = workspace.CurrentCamera
     if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end
     prevCamType = nil
-    if not silent then notify("Макрос", "■ Воспроизведение остановлено", 3) end
+    if not silent then notify("Macros", "■ Остановлено", 2) end
     setStatus("Остановлено")
 end
 
--- Воспроизведение ОДНОГО события
-local function execEvent(ev)
-    local ty = ev.type
+-- Куда кликнуть на ЭТОМ экране
+local function resolveClick(a)
+    -- тот же размер окна: просто повторяем точку записи
+    if Replay.sameView and a.Rx and a.Ry then return toScreen(a.Rx, a.Ry) end
 
-    if ty == "mv" then
-        if cfg.replayMove then
-            local char = LocalPlayer.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then hrp.CFrame = CFrame.new(unpack(ev.c)) end
+    local off = Vector2.new(0, cfg.clickOffsetY or 0)
+
+    -- 1) кнопка интерфейса (Skip / Vote / Upgrade / Target / Slot ...)
+    if a.Gui then
+        local obj = resolveFrom(PlayerGui, a.Gui)
+        if obj and obj:IsA("GuiObject") and isShown(obj) then
+            local ox = a.Go and a.Go[1] or 0.5
+            local oy = a.Go and a.Go[2] or 0.5
+            return guiPoint(obj, ox, oy) + off
         end
-        return
-    elseif ty == "cm" then
-        if cfg.replayCamera then
-            local cam = workspace.CurrentCamera
-            if cam then
-                if cam.CameraType ~= Enum.CameraType.Scriptable then cam.CameraType = Enum.CameraType.Scriptable end
-                cam.CFrame = CFrame.new(unpack(ev.c))
+        if a.Rx and a.Ry then return toScreen(a.Rx, a.Ry) end
+        return nil
+    end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+
+    -- 2) юнит: ищем его заново рядом с записанной позицией
+    if a.UnitPos then
+        local troops = workspace:FindFirstChild("Troops")
+        if troops then
+            local want = Vector3.new(a.UnitPos[1], a.UnitPos[2], a.UnitPos[3])
+            local best, bestD
+            for _, m in ipairs(troops:GetChildren()) do
+                local okp, pv = pcall(function() return m:GetPivot().Position end)
+                if okp then
+                    local d = (pv - want).Magnitude
+                    if d < 8 and (not bestD or d < bestD) and (not a.Name or m.Name == a.Name) then
+                        best, bestD = pv, d
+                    end
+                end
+            end
+            if best then
+                local o = a.Off and Vector3.new(a.Off[1], a.Off[2], a.Off[3]) or Vector3.zero
+                local v, on = cam:WorldToViewportPoint(best + o)
+                if on and v.Z > 0 then return Vector2.new(v.X, v.Y) + off end
             end
         end
-        return
     end
 
-    local remoteMode = tostring(cfg.replayMode):find("Remote") ~= nil
-
-    if ty == "rm" then
-        if not remoteMode then return end
-        local path = ev.r
-        if type(path) ~= "table" or isExcludedRemotePath(path) then return end
-        local remote = resolvePath(path)
-        if not remote then return end
-        local args = {}
-        for i = 1, (ev.n or #ev.a) do args[i] = deser(ev.a[i]) end
-        local n = ev.n or #args
-        if ev.m == "InvokeServer" then
-            task.spawn(function() pcall(function() remote:InvokeServer(unpack(args, 1, n)) end) end)
-        else
-            pcall(function() remote:FireServer(unpack(args, 1, n)) end)
-        end
-        return
+    -- 3) точка в мире (постановка юнита и т.п.)
+    if a.Pos then
+        local v, on = cam:WorldToViewportPoint(Vector3.new(a.Pos[1], a.Pos[2], a.Pos[3]))
+        if on and v.Z > 0 then return Vector2.new(v.X, v.Y) + off end
     end
 
-    if remoteMode or (not VIM and not humanMode()) then return end
+    if a.Rx and a.Ry then return toScreen(a.Rx, a.Ry) end
+    return nil
+end
 
-    -- Все клики/движения — строго по записанным rx/ry (ratio экрана)
-    if ty == "k" then
-        local ok, kc = pcall(function() return Enum.KeyCode[ev.k] end)
-        if ok and kc then
-            if ev.s == 1 then heldKeys[kc] = true else heldKeys[kc] = nil end
-            sendKey(kc, ev.s == 1)
+local function execAction(a)
+    local k = a.Kind
+    if k == "Move" then
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and a.CFrame then hrp.CFrame = CFrame.new(unpack(a.CFrame)) end
+    elseif k == "Camera" then
+        local cam = workspace.CurrentCamera
+        if cam and a.CFrame then
+            if cam.CameraType ~= Enum.CameraType.Scriptable then cam.CameraType = Enum.CameraType.Scriptable end
+            cam.CFrame = CFrame.new(unpack(a.CFrame))
         end
-    elseif ty == "mb" then
-        local pos = toScreen(ev.rx, ev.ry)
-        sendMouseButton(ev.b, ev.s == 1, pos)
-        if ev.s == 1 then heldMouse[ev.b] = pos else heldMouse[ev.b] = nil end
-    elseif ty == "mm" then
-        sendMouseMove(toScreen(ev.rx, ev.ry))
-    elseif ty == "wh" then
-        sendWheel(toScreen(ev.rx, ev.ry), ev.d or 0)
+    elseif k == "Key" then
+        local ok, kc = pcall(function() return Enum.KeyCode[a.Key] end)
+        if ok and kc then doKey(kc, a.Hold) end
+    elseif k == "Wheel" then
+        if Replay.cross then return end
+        sendWheel(toScreen(a.Rx or 0.5, a.Ry or 0.5), a.Dir or 0)
+    elseif a.Button then
+        local pos = resolveClick(a)
+        if pos then doClick(pos, a.Button, a.Hold) end
     end
 end
 
 function Replay.start(name)
     if Replay.playing then Replay.stop(true) end
-    if Recorder.active then notify("Макрос", "Идёт запись", 3) return end
-    cfg.replayMode = "Input"
-
+    if Recorder.active then notify("Macros", "Идёт запись", 3) return end
     local macro = loadMacro(name)
-    if not macro or type(macro.events) ~= "table" or #macro.events == 0 then
-        notify("Макрос", "Макрос пуст или не найден", 3) return
+    if not macro or type(macro.Actions) ~= "table" or #macro.Actions == 0 then
+        notify("Macros", "Макрос пуст или в старом формате — запиши заново", 4) return
     end
-    local events = macro.events
-
-    -- Сортировка по точному времени, потом по seq
-    table.sort(events, function(a, b)
-        if (a.t or 0) ~= (b.t or 0) then return (a.t or 0) < (b.t or 0) end
-        return (a.q or 0) < (b.q or 0)
-    end)
-
-    -- Опциональное сжатие пауз (по дефолту 0 = НЕ сжимать → точь-в-точь)
-    local maxPause = tonumber(cfg.maxPauseMs) or 0
-    if maxPause > 0 then
-        local out, lastOrig, lastNew = {}, 0, 0
-        for idx, ev in ipairs(events) do
-            local origT = ev.t or 0
-            local gap = origT - lastOrig
-            if gap < 0 then gap = 0 end
-            if gap > maxPause then gap = maxPause end
-            lastNew = lastNew + gap
-            lastOrig = origT
-            local ne = {}
-            for k, v in pairs(ev) do ne[k] = v end
-            ne.t = lastNew
-            out[idx] = ne
-        end
-        events = out
-    end
-
     if not VIM and not humanMode() then
-        notify("Макрос", "Нет способа ввода (VirtualInputManager недоступен)", 4) return
+        notify("Macros", "Нет способа ввода (VirtualInputManager)", 4) return
     end
+
+    local actions = macro.Actions
+    local vp = viewport()
+    local mv = macro.Viewport
+    Replay.sameView = (mv and math.abs((mv.X or 0) - vp.X) <= 2 and math.abs((mv.Y or 0) - vp.Y) <= 2) and true or false
+    local dev = pcMode() and "PC" or "Mobile"
+    Replay.cross = (macro.Device ~= nil and macro.Device ~= dev)
 
     Replay.playing = true
-    local i, clock, lastStatus = 1, 0, 0
+    Replay.token = Replay.token + 1
     local cam = workspace.CurrentCamera
     prevCamType = cam and cam.CameraType
-    notify("Макрос", ("▶ Запуск «%s» (%d событий)"):format(name, #events), 3)
 
-    replayConn = RunService.Heartbeat:Connect(function(dt)
+    local i, clock, lastStatus = 1, 0, 0
+    notify("Macros", ("▶ «%s» — %d действий"):format(name, #actions), 3)
+
+    Replay.conn = RunService.Heartbeat:Connect(function(dt)
         if not Replay.playing then return end
-
-        -- Защита от скачков: если игра подвисла — не «выстреливаем» пачку событий
-        if dt > 0.25 then dt = 0.25 end
-        clock = clock + dt * 1000
-
-        -- Выполняем все события, чьё время уже наступило
-        while events[i] and (events[i].t or 0) <= clock do
-            local ok, err = pcall(execEvent, events[i])
-            if not ok then warn("[BHL] event error:", err) end
+        clock = clock + dt
+        local a = actions[i]
+        while a and (a.Time or 0) <= clock do
+            local ok, err = pcall(execAction, a)
+            if not ok then warn("[BHL] action error:", err) end
             i = i + 1
+            a = actions[i]
         end
-
-        -- Конец
-        if not events[i] then
-            if cfg.loopMacro then
-                Replay.stop(true)
-                task.delay(1, function() if State.Alive then Replay.start(name) end end)
-            else
-                Replay.stop(true)
-                notify("Макрос", "✔ Воспроизведение завершено", 3)
-                setStatus("Завершено: " .. name)
-            end
+        if not a then
+            Replay.stop(true)
+            notify("Macros", "✔ Готово", 3)
+            setStatus("Готово: " .. name)
             return
         end
-
         if os.clock() - lastStatus > 0.5 then
             lastStatus = os.clock()
-            setStatus(("▶ %s  [%d/%d]  %.2f сек"):format(name, i - 1, #events, clock / 1000))
+            setStatus(("▶ %d/%d"):format(i - 1, #actions))
         end
     end)
 end
+
+---------------------------------------------------------------------
+-- Ввод: горячие клавиши и запись
+---------------------------------------------------------------------
+track(UIS.InputBegan:Connect(function(input, gp)
+    if pcMode() and input.UserInputType == Enum.UserInputType.Keyboard and not UIS:GetFocusedTextBox() then
+        local kn = input.KeyCode.Name
+        if kn == "F8" then
+            if Recorder.active then Recorder.stop(false) else task.spawn(Recorder.start) end
+            return
+        elseif kn == "F5" then
+            if Replay.playing then Replay.stop() else Replay.start(pcfg.selectedMacro) end
+            return
+        end
+    end
+    onInput(input, true, gp)
+end))
+track(UIS.InputEnded:Connect(function(input, gp) onInput(input, false, gp) end))
+track(UIS.InputChanged:Connect(function(input)
+    if not Recorder.active then return end
+    if input.UserInputType == Enum.UserInputType.MouseWheel then
+        local p = inputToPos(input)
+        addAction({ Kind = "Wheel", Dir = input.Position.Z > 0 and 1 or -1, Rx = p.rx, Ry = p.ry })
+    end
+end))
 
 ---------------------------------------------------------------------
 -- Anti AFK
@@ -866,10 +895,10 @@ local queued = false
 
 local function buildQueueSource()
     local loader
-    if FS_OK and isfile(MAIN_FILE) then
-        loader = ("loadstring(readfile(%q))()"):format(MAIN_FILE)
-    elseif SELF_URL ~= "" then
+    if SELF_URL ~= "" then
         loader = ("loadstring(game:HttpGet(%q))()"):format(SELF_URL)
+    elseif FS_OK and isfile(MAIN_FILE) then
+        loader = ("loadstring(readfile(%q))()"):format(MAIN_FILE)
     else
         return nil
     end
@@ -886,210 +915,225 @@ end
 local function queueSelf(showNotify)
     if queued then return true end
     if not queueFn then
-        if showNotify then notify("Auto Execute", "Executor не поддерживает queue_on_teleport", 4) end
+        if showNotify then notify("Auto Execute", "Нет queue_on_teleport", 4) end
         return false
     end
     local src = buildQueueSource()
     if not src then
-        if showNotify then notify("Auto Execute", "Сохрани скрипт как " .. MAIN_FILE, 6) end
+        if showNotify then notify("Auto Execute", "Укажи SELF_URL или сохрани скрипт как " .. MAIN_FILE, 6) end
         return false
     end
     queued = true
     pcall(queueFn, src)
-    if showNotify then notify("Auto Execute", "Скрипт будет запущен после телепорта", 3) end
+    if showNotify then notify("Auto Execute", "Запустится после телепорта", 3) end
     return true
 end
 
 track(LocalPlayer.OnTeleport:Connect(function()
-    if Recorder.active then Recorder.stop(false) end
+    if Recorder.active then Recorder.stop(false) end -- запись не теряется при телепорте
     if cfg.autoExecute then queueSelf(false) end
 end))
+if cfg.autoExecute then task.defer(queueSelf, false) end
 
 ---------------------------------------------------------------------
--- UI
+-- AutoPlay every match: скрипт загрузился в матче -> через 5 сек запуск макроса
+-- (стартует сразу при загрузке, не ждёт интерфейс)
 ---------------------------------------------------------------------
-local Window = Rayfield:CreateWindow({
-    Name = "BlackHoleHub_LTTD by ART1XL1S",
-    LoadingTitle = "BlackHoleHub_LTTD",
-    LoadingSubtitle = "by ART1XL1S",
-    ConfigurationSaving = { Enabled = false },
-    Discord = { Enabled = false },
-    KeySystem = false,
-    DisableRayfieldPrompts = true,
-    DisableBuildWarnings = true,
-})
-
-local function optName(o)
-    if type(o) == "table" then return o.Title or o.Name or o[1] end
-    return o
-end
-
-local MacrosTab   = Window:CreateTab("Macros", "video")
-local SettingsTab = Window:CreateTab("Settings", "settings")
-
-local newMacroName = ""
-local MacroDropdown
-local statusLabel
-
-setStatus = function(text)
-    if statusLabel then pcall(function() statusLabel:Set(tostring(text)) end) end
-end
-
-local function refreshMacros(selectName)
-    local list = listMacros()
-    local values = #list > 0 and list or { NO_MACRO }
-    if selectName then cfg.selectedMacro = selectName end
-    if not table.find(values, cfg.selectedMacro) then
-        cfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
-    end
-    if MacroDropdown then
-        pcall(function() MacroDropdown:Refresh(values) end)
-        pcall(function() MacroDropdown:Set({ cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO }) end)
-    end
-    saveAll()
-end
-
-MacrosTab:CreateInput({
-    Name = "Macros Name", PlaceholderText = "Название макроса",
-    RemoveTextAfterFocusLost = false,
-    Callback = function(txt) newMacroName = txt end,
-})
-MacrosTab:CreateButton({
-    Name = "Create",
-    Callback = function()
-        local n = createMacro(newMacroName)
-        if n then refreshMacros(n) end
-    end,
-})
-
-do
-    local initial = listMacros()
-    local values = #initial > 0 and initial or { NO_MACRO }
-    if not table.find(values, cfg.selectedMacro) then
-        cfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
-    end
-    MacroDropdown = MacrosTab:CreateDropdown({
-        Name = "Select", Options = values,
-        CurrentOption = { cfg.selectedMacro ~= "" and cfg.selectedMacro or NO_MACRO },
-        MultipleOptions = false,
-        Callback = function(o)
-            o = optName(o)
-            if o and o ~= NO_MACRO then cfg.selectedMacro = o saveAll() end
-        end,
-    })
-end
-
-local function buttonsAllowed()
-    if pcMode() then
-        notify("Macros", "ПК: F8 — запись, F5 — запуск/стоп", 3)
-        return false
-    end
-    return true
-end
-
-MacrosTab:CreateButton({
-    Name = "Record",
-    Callback = function()
-        if not buttonsAllowed() then return end
-        if Recorder.active then Recorder.stop(true) else task.spawn(Recorder.start) end
-    end,
-})
-MacrosTab:CreateButton({
-    Name = "Play",
-    Callback = function()
-        if not buttonsAllowed() then return end
-        if Recorder.active then notify("Macros", "Идёт запись", 3) return end
-        if Replay.playing then Replay.stop() else Replay.start(cfg.selectedMacro) end
-    end,
-})
-
-MacrosTab:CreateDropdown({
-    Name = "Click: Roblox / Human",
-    Options = { "Roblox", "Human" }, CurrentOption = { cfg.clickMode == "Human" and "Human" or "Roblox" },
-    MultipleOptions = false,
-    Callback = function(o)
-        local m = optName(o)
-        if m == "Human" and not (HUMAN_OK and pcMode()) then
-            cfg.clickMode = "Roblox"
-            notify("Click", "Human недоступен — оставил Roblox", 4)
-        else
-            cfg.clickMode = m
-        end
-        saveAll()
-    end,
-})
-MacrosTab:CreateToggle({
-    Name = "Auto Execute", CurrentValue = cfg.autoExecute,
-    Callback = function(v)
-        cfg.autoExecute = v
-        saveAll()
-        if v then task.delay(0.6, function() queueSelf(true) end) end
-    end,
-})
-MacrosTab:CreateToggle({
-    Name = "AutoPlay every match", CurrentValue = cfg.autoRunMacro,
-    Callback = function(v) cfg.autoRunMacro = v saveAll() end,
-})
-MacrosTab:CreateToggle({
-    Name = "Loop Macro", CurrentValue = cfg.loopMacro,
-    Callback = function(v) cfg.loopMacro = v saveAll() end,
-})
-statusLabel = MacrosTab:CreateLabel(pcMode() and "ПК: F8 запись | F5 запуск/стоп" or "Телефон: кнопки Record / Play")
-
-SettingsTab:CreateToggle({
-    Name = "Anti AFK", CurrentValue = cfg.antiAfk,
-    Callback = function(v) cfg.antiAfk = v saveAll() end,
-})
-SettingsTab:CreateToggle({
-    Name = "Записывать движение мыши", CurrentValue = cfg.recordMouseMove,
-    Callback = function(v) cfg.recordMouseMove = v saveAll() end,
-})
-SettingsTab:CreateToggle({
-    Name = "Воспроизводить движение персонажа", CurrentValue = cfg.replayMove,
-    Callback = function(v) cfg.replayMove = v saveAll() end,
-})
-SettingsTab:CreateToggle({
-    Name = "Воспроизводить камеру", CurrentValue = cfg.replayCamera,
-    Callback = function(v) cfg.replayCamera = v saveAll() end,
-})
-SettingsTab:CreateSlider({
-    Name = "Калибровка Y для кликов (px)", Range = { -60, 60 }, Increment = 1, Suffix = " px",
-    CurrentValue = math.clamp(cfg.clickOffsetY or 0, -60, 60),
-    Callback = function(v) cfg.clickOffsetY = math.floor(v) saveAll() end,
-})
-SettingsTab:CreateSlider({
-    Name = "Сжатие пауз (> N мс → N). 0 = точь-в-точь",
-    Range = { 0, 5000 }, Increment = 50, Suffix = " ms",
-    CurrentValue = math.clamp(cfg.maxPauseMs or 0, 0, 5000),
-    Callback = function(v) cfg.maxPauseMs = math.floor(v) saveAll() end,
-})
-
-refreshMacros()
-
----------------------------------------------------------------------
--- AutoPlay при загрузке в матче
----------------------------------------------------------------------
-if cfg.autoExecute then queueSelf(false) end
-
-if IN_GAME and cfg.autoRunMacro and cfg.selectedMacro ~= "" then
+if IN_GAME and pcfg.autoPlay and pcfg.selectedMacro ~= "" then
     task.spawn(function()
-        task.wait(2)
+        task.wait(5)
         if State.Alive and not Replay.playing and not Recorder.active then
-            Replay.start(cfg.selectedMacro)
+            Replay.start(pcfg.selectedMacro)
         end
     end)
 end
 
 ---------------------------------------------------------------------
--- Cleanup
+-- Интерфейс Rayfield (создаётся последним, в отдельном потоке)
 ---------------------------------------------------------------------
 function State.Cleanup()
     State.Alive = false
     Recorder.active = false
     pcall(function() Replay.stop(true) end)
     for _, c in ipairs(State.Conns) do pcall(function() c:Disconnect() end) end
-    genv.BHL_RemoteLogger = nil
-    pcall(function() Rayfield:Destroy() end)
+    pcall(function() if Rayfield then Rayfield:Destroy() end end)
 end
 
-notify("BlackHoleHub_LTTD", "by ART1XL1S — загружено", 3)
+task.spawn(function()
+    local urls = {
+        "https://sirius.menu/rayfield",
+        "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
+    }
+    for _, url in ipairs(urls) do
+        local ok, lib = pcall(function() return loadstring(game:HttpGet(url))() end)
+        if ok and lib then Rayfield = lib break end
+    end
+    if not Rayfield or not State.Alive then
+        warn("[BlackHoleHub_LTTD] Rayfield не загрузился (скрипт работает по F8 / F5)")
+        return
+    end
+
+    -- уменьшаем окно как только оно появится
+    task.spawn(function()
+        for _ = 1, 100 do
+            local done = false
+            pcall(function()
+                local root = (gethui and gethui()) or game:GetService("CoreGui")
+                local g = root:FindFirstChild("Rayfield")
+                local main = g and g:FindFirstChild("Main")
+                if main then
+                    if not main:FindFirstChild("BHL_Scale") then
+                        local sc = Instance.new("UIScale")
+                        sc.Name = "BHL_Scale"
+                        sc.Scale = pcMode() and 0.78 or 0.6
+                        sc.Parent = main
+                    end
+                    done = true
+                end
+            end)
+            if done then break end
+            task.wait(0.05)
+        end
+    end)
+
+    local Window = Rayfield:CreateWindow({
+        Name = "BlackHoleHub_LTTD by ART1XL1S",
+        LoadingTitle = "BlackHoleHub_LTTD",
+        LoadingSubtitle = "by ART1XL1S",
+        ConfigurationSaving = { Enabled = false },
+        Discord = { Enabled = false },
+        KeySystem = false,
+        DisableRayfieldPrompts = true,
+        DisableBuildWarnings = true,
+    })
+    if not State.Alive then return end
+
+    local function optName(o)
+        if type(o) == "table" then return o.Title or o.Name or o[1] end
+        return o
+    end
+
+    local MacrosTab   = Window:CreateTab("Macros", "video")
+    local SettingsTab = Window:CreateTab("Settings", "settings")
+
+    ---------------------------------------------- Macros
+    local newMacroName = ""
+    local MacroDropdown
+    local statusLabel
+
+    setStatus = function(text)
+        if statusLabel then pcall(function() statusLabel:Set(tostring(text)) end) end
+    end
+
+    local function refreshMacros(selectName)
+        local list = listMacros()
+        local values = #list > 0 and list or { NO_MACRO }
+        if selectName then pcfg.selectedMacro = selectName end
+        if not table.find(values, pcfg.selectedMacro) then
+            pcfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
+        end
+        if MacroDropdown then
+            pcall(function() MacroDropdown:Refresh(values) end)
+            pcall(function() MacroDropdown:Set({ pcfg.selectedMacro ~= "" and pcfg.selectedMacro or NO_MACRO }) end)
+        end
+        saveAll()
+    end
+
+    MacrosTab:CreateInput({
+        Name = "Macros Name", PlaceholderText = "Название макроса",
+        RemoveTextAfterFocusLost = false,
+        Callback = function(txt) newMacroName = txt end,
+    })
+    MacrosTab:CreateButton({
+        Name = "Create",
+        Callback = function()
+            local n = createMacro(newMacroName)
+            if n then refreshMacros(n) end
+        end,
+    })
+
+    do
+        local initial = listMacros()
+        local values = #initial > 0 and initial or { NO_MACRO }
+        if not table.find(values, pcfg.selectedMacro) then
+            pcfg.selectedMacro = (values[1] ~= NO_MACRO) and values[1] or ""
+        end
+        MacroDropdown = MacrosTab:CreateDropdown({
+            Name = "Select", Options = values,
+            CurrentOption = { pcfg.selectedMacro ~= "" and pcfg.selectedMacro or NO_MACRO },
+            MultipleOptions = false,
+            Callback = function(o)
+                o = optName(o)
+                if o and o ~= NO_MACRO then pcfg.selectedMacro = o saveAll() end
+            end,
+        })
+    end
+
+    -- ПК: кнопки меню отключены (только F8 / F5), чтобы клик не включал запись. Телефон: кнопки.
+    local function buttonsAllowed()
+        if pcMode() then
+            notify("Macros", "ПК: F8 — запись, F5 — запуск/стоп", 3)
+            return false
+        end
+        return true
+    end
+
+    MacrosTab:CreateButton({
+        Name = "Record",
+        Callback = function()
+            if not buttonsAllowed() then return end
+            if Recorder.active then Recorder.stop(true) else task.spawn(Recorder.start) end
+        end,
+    })
+    MacrosTab:CreateButton({
+        Name = "Play",
+        Callback = function()
+            if not buttonsAllowed() then return end
+            if Recorder.active then notify("Macros", "Идёт запись", 3) return end
+            if Replay.playing then Replay.stop() else Replay.start(pcfg.selectedMacro) end
+        end,
+    })
+    MacrosTab:CreateDropdown({
+        Name = "Click Mode",
+        Options = { "Roblox", "Human" }, CurrentOption = { cfg.clickMode == "Human" and "Human" or "Roblox" },
+        MultipleOptions = false,
+        Callback = function(o)
+            local m = optName(o)
+            if m == "Human" and not (HUMAN_OK and pcMode()) then
+                cfg.clickMode = "Roblox"
+                notify("Click", "Human недоступен (нужен ПК и mousemoveabs) — Roblox", 4)
+            else
+                cfg.clickMode = m
+                if m == "Human" then notify("Click", "Human: Roblox в полноэкранном режиме (F11)", 4) end
+            end
+            saveAll()
+        end,
+    })
+    MacrosTab:CreateToggle({
+        Name = "Auto Execute", CurrentValue = cfg.autoExecute,
+        Callback = function(v)
+            cfg.autoExecute = v
+            saveAll()
+            if v then task.delay(0.6, function() queueSelf(true) end) end
+        end,
+    })
+    MacrosTab:CreateToggle({
+        Name = "AutoPlay every match", CurrentValue = pcfg.autoPlay,
+        Callback = function(v) pcfg.autoPlay = v saveAll() end,
+    })
+    statusLabel = MacrosTab:CreateLabel(pcMode() and "ПК: F8 запись | F5 запуск/стоп" or "Телефон: Record / Play")
+
+    ---------------------------------------------- Settings
+    SettingsTab:CreateToggle({
+        Name = "Anti AFK", CurrentValue = cfg.antiAfk,
+        Callback = function(v) cfg.antiAfk = v saveAll() end,
+    })
+    SettingsTab:CreateSlider({
+        Name = "Калибровка Y кликов (px)", Range = { -60, 60 }, Increment = 1, Suffix = " px",
+        CurrentValue = math.clamp(cfg.clickOffsetY or 0, -60, 60),
+        Callback = function(v) cfg.clickOffsetY = math.floor(v) saveAll() end,
+    })
+
+    refreshMacros()
+    notify("BlackHoleHub_LTTD", "by ART1XL1S — загружено", 2)
+end)
