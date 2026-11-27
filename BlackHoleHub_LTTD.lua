@@ -199,6 +199,18 @@ local function resolveFrom(root, path)
     return cur
 end
 
+-- Деньги из Match.MoneyFrame.GameMoney ("$1,234", "$1.2K" ...)
+local function getMoney()
+    local lbl = resolveFrom(PlayerGui, { "Match", "MoneyFrame", "GameMoney" })
+    if not lbl or not lbl:IsA("TextLabel") then return nil end
+    local txt = lbl.Text:gsub(",", "")
+    local num, suf = txt:match("([%d%.]+)%s*([KkMmBb]?)")
+    num = tonumber(num)
+    if not num then return nil end
+    local mult = ({ k = 1e3, m = 1e6, b = 1e9 })[(suf or ""):lower()] or 1
+    return math.floor(num * mult + 0.5)
+end
+
 ---------------------------------------------------------------------
 -- Макро-файлы
 ---------------------------------------------------------------------
@@ -438,35 +450,29 @@ local function sendWheel(pos, d)
     end
 end
 
--- клик с задержкой (курсор успевает прийти в точку) — в отдельном потоке
-local function doClick(pos, button, hold)
-    task.spawn(function()
-        local touched = false
-        if (not pcMode()) and VIM and button == 1 and not humanMode() then
-            touched = pcall(function() VIM:SendTouchEvent(1, 0, pos.X, pos.Y) end)
-        end
-        if not touched then
-            sendMove(pos)
-            task.wait(0.04)
-            sendMouse(button, true, pos)
-        end
-        task.wait(math.max(hold or 0, 0.04))
-        if touched then
-            pcall(function() VIM:SendTouchEvent(1, 2, pos.X, pos.Y) end)
-        else
-            sendMouse(button, false, pos)
-        end
-    end)
+local heldClicks = {}
+
+local function pressDown(a, pos)
+    local useTouch = (not pcMode()) and VIM and a.Button == 1 and not humanMode()
+    a._touch = false
+    if useTouch then
+        a._touch = pcall(function() VIM:SendTouchEvent(1, 0, pos.X, pos.Y) end)
+    end
+    if not a._touch then sendMouse(a.Button, true, pos) end
+    a._down = true
+    heldClicks[a] = true
 end
 
-local function doKey(kc, hold)
-    task.spawn(function()
-        heldKeys[kc] = true
-        sendKey(kc, true)
-        task.wait(math.max(hold or 0, 0.03))
-        sendKey(kc, false)
-        heldKeys[kc] = nil
-    end)
+local function pressUp(a)
+    if not a._down then return end
+    local pos = a._pos
+    if a._touch then
+        pcall(function() VIM:SendTouchEvent(1, 2, pos.X, pos.Y) end)
+    else
+        sendMouse(a.Button, false, pos)
+    end
+    a._down = false
+    heldClicks[a] = nil
 end
 
 ---------------------------------------------------------------------
@@ -476,15 +482,23 @@ local Recorder = {
     active = false, starting = false, t0 = 0, actions = {},
     pendClick = {}, pendKey = {}, unitKey = {}, nextKey = 0,
     selectedKey = nil, lastWorld = nil, lastWorldClock = 0,
-    lastMove = nil, lastCam = nil,
+    lastMove = nil, lastCam = nil, lastFov = nil,
+    lastMouseT = -1, lastMouseX = -100, lastMouseY = -100,
+    conns = {}, waveStart = 0, snapshot = nil,
 }
 local Replay = { playing = false, token = 0, sameView = false, cross = false }
 
 local function nowSec() return math.floor((os.clock() - Recorder.t0) * 1000 + 0.5) / 1000 end
 
-local function addAction(a)
+-- light = true: только Time (Move / Camera / Mouse / State). Иначе + Wave, WaveTime, Money
+local function addAction(a, light)
     a.Time = nowSec()
-    a.Wave = curWave()
+    if not light then
+        a.Wave = curWave()
+        a.WaveTime = r3(os.clock() - Recorder.waveStart) -- секунда внутри текущей волны
+        local m = getMoney()
+        if m then a.Money = m end
+    end
     Recorder.actions[#Recorder.actions + 1] = a
     return a
 end
@@ -522,6 +536,98 @@ local function overUI(x, y)
     return false
 end
 
+local function simple(v)
+    local t = type(v)
+    return t == "number" or t == "string" or t == "boolean"
+end
+
+local function snapAttrs(model)
+    local at, vals = {}, {}
+    pcall(function()
+        for k, v in pairs(model:GetAttributes()) do
+            if simple(v) then at[k] = v end
+        end
+        for _, c in ipairs(model:GetChildren()) do
+            if c:IsA("ValueBase") then
+                local ok, v = pcall(function() return c.Value end)
+                if ok and simple(v) then vals[c.Name] = v end
+            end
+        end
+    end)
+    return at, vals
+end
+
+-- слушаем атрибуты и Value-объекты юнита (уровень, цель и т.п.)
+local function hookUnit(model)
+    local conns = Recorder.conns
+    conns[#conns + 1] = model.AttributeChanged:Connect(function(attr)
+        if not Recorder.active then return end
+        local ok, val = pcall(function() return model:GetAttribute(attr) end)
+        if ok and simple(val) then
+            addAction({ Kind = "UnitAttr", Key = unitKeyFor(model), Name = model.Name, Attr = attr, Value = val })
+        end
+    end)
+    for _, c in ipairs(model:GetChildren()) do
+        if c:IsA("ValueBase") then
+            conns[#conns + 1] = c.Changed:Connect(function(nv)
+                if Recorder.active and simple(nv) then
+                    addAction({ Kind = "UnitValue", Key = unitKeyFor(model), Name = model.Name, Attr = c.Name, Value = nv })
+                end
+            end)
+        end
+    end
+end
+
+-- Волна, состояние матча, деньги, юниты — пишем всё
+local function hookRecorderSources()
+    Recorder.waveStart = os.clock()
+    local snap = { Wave = curWave(), Money = getMoney(), State = {}, Units = {} }
+    local conns = Recorder.conns
+
+    local md = ReplicatedStorage:FindFirstChild("MatchData")
+    if md then
+        for _, v in ipairs(md:GetChildren()) do
+            if v:IsA("ValueBase") then
+                local ok, val = pcall(function() return v.Value end)
+                if ok and simple(val) then
+                    snap.State[v.Name] = val
+                    conns[#conns + 1] = v.Changed:Connect(function(nv)
+                        if not Recorder.active then return end
+                        if v.Name == "CurrentWave" then
+                            Recorder.waveStart = os.clock()
+                            addAction({ Kind = "Wave", Value = nv })
+                        else
+                            addAction({ Kind = "State", Name = v.Name, Value = nv }, true)
+                        end
+                    end)
+                end
+            end
+        end
+    end
+
+    local lbl = resolveFrom(PlayerGui, { "Match", "MoneyFrame", "GameMoney" })
+    if lbl and lbl:IsA("TextLabel") then
+        conns[#conns + 1] = lbl:GetPropertyChangedSignal("Text"):Connect(function()
+            if not Recorder.active then return end
+            local m = getMoney()
+            if m then addAction({ Kind = "Money", Value = m }, true) end
+        end)
+    end
+
+    local troops = workspace:FindFirstChild("Troops")
+    if troops then
+        for _, u in ipairs(troops:GetChildren()) do
+            local okp, pv = pcall(function() return u:GetPivot().Position end)
+            snap.Units[#snap.Units + 1] = {
+                Key = unitKeyFor(u), Name = u.Name,
+                Pos = okp and { r3(pv.X), r3(pv.Y), r3(pv.Z) } or nil,
+            }
+            hookUnit(u)
+        end
+    end
+    Recorder.snapshot = snap
+end
+
 function Recorder.start()
     if Recorder.active or Recorder.starting then return end
     if Replay.playing then notify("Запись", "Сначала останови макрос", 3) return end
@@ -533,21 +639,24 @@ function Recorder.start()
 
     Recorder.actions, Recorder.pendClick, Recorder.pendKey = {}, {}, {}
     Recorder.unitKey, Recorder.nextKey, Recorder.selectedKey = {}, 0, nil
-    Recorder.lastWorld, Recorder.lastMove, Recorder.lastCam = nil, nil, nil
+    Recorder.lastWorld, Recorder.lastMove, Recorder.lastCam, Recorder.lastFov = nil, nil, nil, nil
+    Recorder.lastMouseT, Recorder.lastMouseX, Recorder.lastMouseY = -1, -100, -100
+    Recorder.conns = {}
     Recorder.t0 = os.clock()
     Recorder.name = name
     Recorder.active = true
+    hookRecorderSources()
 
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if hrp then
         Recorder.lastMove = comps12(hrp.CFrame)
-        addAction({ Kind = "Move", CFrame = Recorder.lastMove })
+        addAction({ Kind = "Move", CFrame = Recorder.lastMove }, true)
     end
     local cam = workspace.CurrentCamera
     if cam then
-        Recorder.lastCam = comps12(cam.CFrame)
-        addAction({ Kind = "Camera", CFrame = Recorder.lastCam })
+        Recorder.lastCam, Recorder.lastFov = comps12(cam.CFrame), r3(cam.FieldOfView)
+        addAction({ Kind = "Camera", CFrame = Recorder.lastCam, Fov = Recorder.lastFov }, true)
     end
     notify("Запись", "● ИДЁТ ЗАПИСЬ «" .. name .. "»", 3)
     setStatus("● Запись: " .. name)
@@ -556,6 +665,8 @@ end
 function Recorder.stop(byUi)
     if not Recorder.active then return end
     Recorder.active = false
+    for _, c in ipairs(Recorder.conns or {}) do pcall(function() c:Disconnect() end) end
+    Recorder.conns = {}
     local endT = nowSec()
 
     -- закрываем незавершённые нажатия
@@ -573,10 +684,15 @@ function Recorder.stop(byUi)
         actions = clean
     end
 
+    local stats = {}
+    for _, a in ipairs(actions) do stats[a.Kind] = (stats[a.Kind] or 0) + 1 end
+
     local data = newMacroData(Recorder.name)
     local md = ReplicatedStorage:FindFirstChild("MatchData")
     local mapId = md and md:FindFirstChild("MapId")
     data.Map = mapId and mapId.Value or nil
+    data.Snapshot = Recorder.snapshot
+    data.Stats = stats
     data.Duration = endT
     data.ActionCount = #actions
     data.Actions = actions
@@ -591,7 +707,7 @@ function Recorder.stop(byUi)
     Recorder.actions = {}
 end
 
--- каждый кадр: движение и камера
+-- каждый кадр: движение, камера (позиция + FOV)
 track(RunService.Heartbeat:Connect(function()
     if not Recorder.active then return end
     local char = LocalPlayer.Character
@@ -600,15 +716,15 @@ track(RunService.Heartbeat:Connect(function()
         local c = comps12(hrp.CFrame)
         if not sameComps(c, Recorder.lastMove) then
             Recorder.lastMove = c
-            addAction({ Kind = "Move", CFrame = c })
+            addAction({ Kind = "Move", CFrame = c }, true)
         end
     end
     local cam = workspace.CurrentCamera
     if cam then
-        local c = comps12(cam.CFrame)
-        if not sameComps(c, Recorder.lastCam) then
-            Recorder.lastCam = c
-            addAction({ Kind = "Camera", CFrame = c })
+        local c, fov = comps12(cam.CFrame), r3(cam.FieldOfView)
+        if not sameComps(c, Recorder.lastCam) or fov ~= Recorder.lastFov then
+            Recorder.lastCam, Recorder.lastFov = c, fov
+            addAction({ Kind = "Camera", CFrame = c, Fov = fov }, true)
         end
     end
 end))
@@ -672,6 +788,12 @@ local function onInput(input, down, gp)
         end
         addAction(a)
         Recorder.pendClick[b] = a
+        if a.Kind == "Upgrade" or a.Kind == "Sell" then
+            task.delay(0.5, function()
+                local m = getMoney()
+                if m and a.Money then a.Cost = a.Money - m end -- минус = получили деньги
+            end)
+        end
     else
         local a = Recorder.pendClick[b]
         if a then
@@ -681,51 +803,74 @@ local function onInput(input, down, gp)
     end
 end
 
--- Новый юнит в Workspace.Troops сразу после клика по земле = Place
+-- Юниты: любой новый юнит пишем (UnitAdded), а если он появился сразу после
+-- моего клика по земле — этот клик помечается как Place (название, позиция, цена)
 if IN_GAME then
     task.spawn(function()
         local troops = workspace:WaitForChild("Troops", 15)
         if not troops or not State.Alive then return end
         track(troops.ChildAdded:Connect(function(child)
             if not Recorder.active then return end
-            local a = Recorder.lastWorld
-            if not a or os.clock() - Recorder.lastWorldClock > 2.5 then return end
-            Recorder.lastWorld = nil
+            local placeA
+            local a0 = Recorder.lastWorld
+            if a0 and os.clock() - Recorder.lastWorldClock <= 2.5 then
+                placeA = a0
+                Recorder.lastWorld = nil
+            end
+            local added = addAction({ Kind = "UnitAdded", Name = child.Name, Key = unitKeyFor(child) })
             task.wait(0.1)
             pcall(function()
                 local pv = child:GetPivot().Position
-                a.Kind = "Place"
-                a.Name = child.Name
-                a.Key = unitKeyFor(child)
-                a.UnitPos = { r3(pv.X), r3(pv.Y), r3(pv.Z) }
-                Recorder.selectedKey = a.Key
+                added.Pos = { r3(pv.X), r3(pv.Y), r3(pv.Z) }
+                added.Attrs, added.Values = snapAttrs(child)
+                if Recorder.active then hookUnit(child) end
+                if placeA then
+                    placeA.Kind = "Place"
+                    placeA.Name = child.Name
+                    placeA.Key = added.Key
+                    placeA.UnitPos = added.Pos
+                    Recorder.selectedKey = placeA.Key
+                    task.delay(0.5, function()
+                        local m = getMoney()
+                        if m and placeA.Money then placeA.Cost = placeA.Money - m end
+                    end)
+                end
             end)
+        end))
+        track(troops.ChildRemoved:Connect(function(child)
+            if not Recorder.active then return end
+            addAction({ Kind = "UnitRemoved", Name = child.Name, Key = Recorder.unitKey[child] })
         end))
     end)
 end
 
 ---------------------------------------------------------------------
--- Воспроизведение
+-- Воспроизведение: TimeTask — точный планировщик по времени записи
 ---------------------------------------------------------------------
-local prevCamType
+local prevCamType, prevFov
+local LEAD = 0.05 -- курсор приходит в точку за 50 мс до клика
 
 function Replay.stop(silent)
     if not Replay.playing then return end
     Replay.playing = false
     Replay.token = Replay.token + 1
     if Replay.conn then Replay.conn:Disconnect() Replay.conn = nil end
+    for a in pairs(heldClicks) do pcall(pressUp, a) end
     for kc in pairs(heldKeys) do sendKey(kc, false) end
-    heldKeys = {}
+    heldClicks, heldKeys = {}, {}
     local cam = workspace.CurrentCamera
-    if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end
-    prevCamType = nil
+    if cam then
+        if prevCamType then pcall(function() cam.CameraType = prevCamType end) end
+        if prevFov then pcall(function() cam.FieldOfView = prevFov end) end
+    end
+    prevCamType, prevFov = nil, nil
     if not silent then notify("Macros", "■ Остановлено", 2) end
     setStatus("Остановлено")
 end
 
 -- Куда кликнуть на ЭТОМ экране
 local function resolveClick(a)
-    -- тот же размер окна: просто повторяем точку записи
+    -- тот же размер окна: повторяем точку записи
     if Replay.sameView and a.Rx and a.Ry then return toScreen(a.Rx, a.Ry) end
 
     local off = Vector2.new(0, cfg.clickOffsetY or 0)
@@ -745,7 +890,7 @@ local function resolveClick(a)
     local cam = workspace.CurrentCamera
     if not cam then return nil end
 
-    -- 2) юнит: ищем его заново рядом с записанной позицией
+    -- 2) юнит: ищем заново рядом с записанной позицией
     if a.UnitPos then
         local troops = workspace:FindFirstChild("Troops")
         if troops then
@@ -778,27 +923,71 @@ local function resolveClick(a)
     return nil
 end
 
-local function execAction(a)
-    local k = a.Kind
-    if k == "Move" then
+-- Все действия раскладываются в одну временную шкалу (нажатие, удержание, отпускание)
+local function buildTimeline(actions)
+    local tl, n = {}, 0
+    local function push(t, f, a)
+        n = n + 1
+        tl[n] = { t = t, i = n, f = f, a = a }
+    end
+    for _, a in ipairs(actions) do
+        local k, t = a.Kind, (a.Time or 0)
+        if k == "Move" or k == "Camera" or k == "Mouse" or k == "Wheel" then
+            push(t, k, a)
+        elseif k == "Key" then
+            push(t, "KeyDown", a)
+            push(t + math.max(a.Hold or 0.05, 0.03), "KeyUp", a)
+        elseif a.Button then
+            push(math.max(t - LEAD, 0), "ClickMove", a)
+            push(t, "ClickDown", a)
+            push(t + math.max(a.Hold or 0.08, 0.04), "ClickUp", a)
+        end
+        -- Wave / State / Money / Unit* — это журнал, при запуске не исполняется
+    end
+    table.sort(tl, function(x, y)
+        if x.t ~= y.t then return x.t < y.t end
+        return x.i < y.i
+    end)
+    return tl
+end
+
+local function keyOf(a)
+    local ok, kc = pcall(function() return Enum.KeyCode[a.Key] end)
+    return ok and kc or nil
+end
+
+local function runEntry(e)
+    local a, f = e.a, e.f
+    if f == "Move" then
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if hrp and a.CFrame then hrp.CFrame = CFrame.new(unpack(a.CFrame)) end
-    elseif k == "Camera" then
+    elseif f == "Camera" then
         local cam = workspace.CurrentCamera
         if cam and a.CFrame then
             if cam.CameraType ~= Enum.CameraType.Scriptable then cam.CameraType = Enum.CameraType.Scriptable end
             cam.CFrame = CFrame.new(unpack(a.CFrame))
+            if a.Fov then cam.FieldOfView = a.Fov end
         end
-    elseif k == "Key" then
-        local ok, kc = pcall(function() return Enum.KeyCode[a.Key] end)
-        if ok and kc then doKey(kc, a.Hold) end
-    elseif k == "Wheel" then
-        if Replay.cross then return end
-        sendWheel(toScreen(a.Rx or 0.5, a.Ry or 0.5), a.Dir or 0)
-    elseif a.Button then
+    elseif f == "Mouse" then
+        if pcMode() and not Replay.cross then sendMove(toScreen(a.Rx, a.Ry)) end
+    elseif f == "Wheel" then
+        if not Replay.cross then sendWheel(toScreen(a.Rx or 0.5, a.Ry or 0.5), a.Dir or 0) end
+    elseif f == "KeyDown" then
+        local kc = keyOf(a)
+        if kc then heldKeys[kc] = true sendKey(kc, true) end
+    elseif f == "KeyUp" then
+        local kc = keyOf(a)
+        if kc then sendKey(kc, false) heldKeys[kc] = nil end
+    elseif f == "ClickMove" then
         local pos = resolveClick(a)
-        if pos then doClick(pos, a.Button, a.Hold) end
+        a._pos = pos
+        if pos and pcMode() then sendMove(pos) end
+    elseif f == "ClickDown" then
+        local pos = a._pos or resolveClick(a)
+        if pos then a._pos = pos pressDown(a, pos) end
+    elseif f == "ClickUp" then
+        pressUp(a)
     end
 end
 
@@ -813,32 +1002,35 @@ function Replay.start(name)
         notify("Macros", "Нет способа ввода (VirtualInputManager)", 4) return
     end
 
-    local actions = macro.Actions
     local vp = viewport()
     local mv = macro.Viewport
     Replay.sameView = (mv and math.abs((mv.X or 0) - vp.X) <= 2 and math.abs((mv.Y or 0) - vp.Y) <= 2) and true or false
-    local dev = pcMode() and "PC" or "Mobile"
-    Replay.cross = (macro.Device ~= nil and macro.Device ~= dev)
+    Replay.cross = (macro.Device ~= nil and macro.Device ~= (pcMode() and "PC" or "Mobile"))
+
+    local tl = buildTimeline(macro.Actions)
+    if #tl == 0 then notify("Macros", "В макросе нет исполняемых действий", 3) return end
 
     Replay.playing = true
     Replay.token = Replay.token + 1
     local cam = workspace.CurrentCamera
     prevCamType = cam and cam.CameraType
+    prevFov = cam and cam.FieldOfView
 
-    local i, clock, lastStatus = 1, 0, 0
-    notify("Macros", ("▶ «%s» — %d действий"):format(name, #actions), 3)
+    local i, lastStatus = 1, 0
+    local startClock = os.clock()
+    notify("Macros", ("▶ «%s» — %d действий, %.0f сек"):format(name, #macro.Actions, tl[#tl].t), 3)
 
-    Replay.conn = RunService.Heartbeat:Connect(function(dt)
+    Replay.conn = RunService.Heartbeat:Connect(function()
         if not Replay.playing then return end
-        clock = clock + dt
-        local a = actions[i]
-        while a and (a.Time or 0) <= clock do
-            local ok, err = pcall(execAction, a)
+        local now = os.clock() - startClock
+        local e = tl[i]
+        while e and e.t <= now do
+            local ok, err = pcall(runEntry, e)
             if not ok then warn("[BHL] action error:", err) end
             i = i + 1
-            a = actions[i]
+            e = tl[i]
         end
-        if not a then
+        if not e then
             Replay.stop(true)
             notify("Macros", "✔ Готово", 3)
             setStatus("Готово: " .. name)
@@ -846,7 +1038,7 @@ function Replay.start(name)
         end
         if os.clock() - lastStatus > 0.5 then
             lastStatus = os.clock()
-            setStatus(("▶ %d/%d"):format(i - 1, #actions))
+            setStatus(("▶ %d/%d | %.0f с | волна %d"):format(i - 1, #tl, now, curWave()))
         end
     end)
 end
@@ -870,9 +1062,19 @@ end))
 track(UIS.InputEnded:Connect(function(input, gp) onInput(input, false, gp) end))
 track(UIS.InputChanged:Connect(function(input)
     if not Recorder.active then return end
-    if input.UserInputType == Enum.UserInputType.MouseWheel then
+    local ut = input.UserInputType
+    if ut == Enum.UserInputType.MouseWheel then
         local p = inputToPos(input)
         addAction({ Kind = "Wheel", Dir = input.Position.Z > 0 and 1 or -1, Rx = p.rx, Ry = p.ry })
+    elseif ut == Enum.UserInputType.MouseMovement then
+        -- путь курсора: не чаще 50 раз/сек и сдвиг от 2 px
+        local t = nowSec()
+        if t - Recorder.lastMouseT < 0.02 then return end
+        local p = inputToPos(input)
+        if math.abs(p.x - Recorder.lastMouseX) + math.abs(p.y - Recorder.lastMouseY) < 2 then return end
+        if overUI(p.x, p.y) then return end
+        Recorder.lastMouseT, Recorder.lastMouseX, Recorder.lastMouseY = t, p.x, p.y
+        addAction({ Kind = "Mouse", Rx = p.rx, Ry = p.ry, X = p.x, Y = p.y }, true)
     end
 end))
 
